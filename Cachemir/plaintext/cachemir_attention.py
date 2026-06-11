@@ -1,19 +1,11 @@
 """
-cachemir_kernel.py
+cachemir_attention.py
 ==================
-Plaintext simulation of Cachemir's Interleaved Replicated Packing VMM
-(Figure 4e of arXiv:2602.11470): C = X @ B, with X encrypted, B plaintext.
-
-The algorithm is based on the diagonal (Halevi-Shoup) method: B is expanded
-into its generalized diagonals, each multiplied by a correspondingly rotated
-copy of X, and the partial products summed.  Cachemir's contribution is to
-*interleave* both the replicated input and the diagonals so the whole thing
-runs with standard rotations only (no inner rotations), at multiplicative
-depth 1.
-
+Plaintext simulation of Cachemir's Interleaved Replicated Packing.
 Conventions
 -----------
-  N        polynomial degree / slot count   (power of two)
+  N        polynomial degree (power of two)
+  n_he     slot count   (power of two)
   d        feature dimension
   t = N/d  interleaving / replication factor
   n_iters = d/t   number of multiply-accumulate steps
@@ -24,7 +16,7 @@ Slot layout
 -----------
 Everything stays in the *interleaved* format end to end: a length-d logical
 vector V is stored with V[g] in slot g*t, the other slots being scratch.
-This is deliberate - the output of one VMM can feed straight into the next
+The output of one VMM can feed straight into the next
 layer without re-encoding (needed for chaining Q/K/V projections, MLP, etc.).
 """
 
@@ -37,17 +29,23 @@ import numpy as np
 def preprocess_input(X, N, d):
     """
     Encode X into the interleaved replicated layout.
-
+ 
+    The client supplies the sparse encoding [x0, 0, x1, 0, ...] (X at every t-th
+    slot).  Filling it into the replicated form takes log2(t) = log2(N/d)
+    rotate-and-add steps with stride 2^i*(t-1):
+ 
         enc[s] = X[(s//t + s%t) % d]
-
+ 
     Example (d=4, N=8, t=2):  [x0, x1, x1, x2, x2, x3, x3, x0]
-
-    In FHE this is produced from the interleaved-with-zeros vector
-    [x0,0,x1,0,...] using log2(t) rotate-and-add operations; on plaintext we
-    write the closed form directly (identical result).
     """
     t = N // d
-    return np.array([X[(s // t + s % t) % d] for s in range(N)], dtype=np.float64)
+    enc = np.zeros(N, dtype=np.float64)
+    enc[::t] = X                         # client-side sparse encoding
+    i = 0
+    while (1 << i) < t:                  # log2(t) rotate-add steps
+        enc = enc + np.roll(enc, -((1 << i) * (t - 1)))
+        i += 1
+    return enc
 
 
 # ---------------------------------------------------------------------------
@@ -61,10 +59,6 @@ def preprocess_weights(B, N, d):
 
     - column index  (s//t) % d   selects which output column (diagonal group)
     - row index     (s//t + s%t + iter*t) % d   walks the diagonal
-
-    For N=8, d=4, t=2 this reproduces Figure 4(e) exactly:
-        W_0 = [b00, b10, b11, b21, b22, b32, b33, b03]
-        W_1 = [b20, b30, b31, b01, b02, b12, b13, b23]
     """
     t = N // d
     n_iters = d // t
@@ -78,7 +72,8 @@ def preprocess_weights(B, N, d):
 
 
 # ---------------------------------------------------------------------------
-# Steps 2-4 - multiply-accumulate, reduce, mask
+# Steps 2-4 - multiply-accumulate, reduce, mask 
+# Vector-Matrix Multiply, generating Q, K, and V
 # ---------------------------------------------------------------------------
 def vmm(X_enc, W_list, N, d, pos=0):
     """
