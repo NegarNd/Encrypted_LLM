@@ -55,7 +55,7 @@ class VCache:
         self.d = d
         self.H = normalize_heads(H)
         self.t = N // d
-        self.dh = d // self.H        # V-ciphertexts per block
+        self.dh = d // self.H        # V-ciphertexts per blockی
         self.cap = N // self.H       # tokens per block
         self.blocks = []     # each block: list of d/H length-N arrays
         self.length = 0      # number of tokens cached
