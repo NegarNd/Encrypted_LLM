@@ -22,7 +22,6 @@ layer without re-encoding (needed for chaining Q/K/V projections, MLP, etc.).
 
 import numpy as np
 
-
 # ---------------------------------------------------------------------------
 # Step 1a - preprocess the input vector X  (client-side, before encryption)
 # ---------------------------------------------------------------------------
@@ -47,7 +46,7 @@ def preprocess_input(X, N, d):
         i += 1
     return enc
 
-
+ 
 # ---------------------------------------------------------------------------
 # Step 1b - preprocess the weight matrix B into interleaved diagonals
 # ---------------------------------------------------------------------------

@@ -20,7 +20,7 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 # ----- parameters: edit these -----
-N     = 8
+N     = 16
 d     = 8
 H     = 4
 n_kv  = 2
@@ -45,12 +45,13 @@ print(f"d_h={d_h}, ratio={ratio}, t_p={t_p}, B={B}, "
       f"n_k_ct={n_k_ct}, n_att_ct={n_att_ct}")
 
 rng = np.random.default_rng(seed)
-Q = rng.standard_normal(d).astype(np.float64)
-K = rng.standard_normal((n_kv * d_h, n_p)).astype(np.float64)
-V = rng.standard_normal((n_p, n_kv * d_h)).astype(np.float64)
+Q = rng.integers(-5, 6, size=d).astype(np.int64)
+K = rng.integers(-5, 6, size=(n_kv * d_h, n_p)).astype(np.int64)
+# Q = rng.standard_normal(d).astype(np.float64)
+# K = rng.standard_normal((n_kv * d_h, n_p)).astype(np.float64)
+V = rng.integers(-5, 6, size=(n_p, n_kv * d_h)).astype(np.int64)
 V_pad = np.zeros((n_tok_pad, n_kv * d_h))
 V_pad[:n_p] = V
-
 
 # ---------------------------------------------------------------------------
 # Encode Q -- ratio ciphertexts
@@ -64,7 +65,7 @@ for c in range(ratio):
             for rep in range(t_p):
                 slot = dim * B + kv * t_p + rep
                 Q_cts[c, slot] = Q[(kv * ratio + c) * d_h + dim]
-
+print("Q encoded: ", Q_cts)
 # ---------------------------------------------------------------------------
 # Encode K -- n_k_ct ciphertexts
 #   slot = dim*B + kv*t_p + tok_in_ct
@@ -81,7 +82,7 @@ for k in range(n_k_ct):
                 slot = dim * B + kv * t_p + tok_in_ct
                 K_cts[k, slot] = K[kv * d_h + dim, tok]
 
-
+print("K encoded:" , K_cts)
 # ---------------------------------------------------------------------------
 # QK^T  -- att_cts[c][g], g in [0, n_att_ct), each covering tokens
 #          [g*d_h*t_p, (g+1)*d_h*t_p)

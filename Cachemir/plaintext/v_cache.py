@@ -86,14 +86,14 @@ class VCache:
         (d/H) at slot k*t + (i_in % t).  This is the rotation-free customizable
         packing (rotate once by r, then d/H masked adds in the FHE version).
         """
-        v = np.asarray(v_interleaved, dtype=np.float64)
+        v = np.asarray(v_interleaved, dtype=np.int64)
         if v.shape != (self.N,):
             raise ValueError(f"v must have shape ({self.N},), got {v.shape}.")
 
         i = self.length
         b, i_in = divmod(i, self.cap)
         if b == len(self.blocks):
-            self.blocks.append([np.zeros(self.N, dtype=np.float64) for _ in range(self.dh)])
+            self.blocks.append([np.zeros(self.N, dtype=np.int64) for _ in range(self.dh)])
 
         r = i_in % self.t
         Vr = np.roll(v, r)                       # rotate right by r (FHE-legal)
@@ -101,8 +101,8 @@ class VCache:
             # ciphertext c receives the group k with ((i_in//t) - (k//H)) % dh == c
             for k in range(self.d):
                 if ((i_in // self.t) - (k // self.H)) % self.dh == c:
-                    mask = np.zeros(self.N, dtype=np.float64)
-                    mask[k * self.t + r] = 1.0
+                    mask = np.zeros(self.N, dtype=np.int64)
+                    mask[k * self.t + r] = 1
                     self.blocks[b][c] += Vr * mask
         self.length += 1
 
@@ -110,7 +110,7 @@ class VCache:
         """Project input X through Wv and append. Pass the raw Wv (raw=True)."""
         Wv = Wv_enc_or_raw
         # caller passes raw Wv; head reorder must match make_weights
-        from cachemir_attention import head_perm
+        from cachemir_attention_new import head_perm
         perm = head_perm(self.d, self.H)
         v = vmm(
             preprocess_input(X, self.N, self.d),
@@ -133,7 +133,7 @@ class VCache:
         b, i_in = divmod(i, self.cap)
         r = i_in % self.t
         block = self.blocks[b]
-        out = np.zeros(self.d, dtype=np.float64)
+        out = np.zeros(self.d, dtype=np.int64)
         for k in range(self.d):
             c = ((i_in // self.t) - (k // self.H)) % self.dh
             out[k] = block[c][k * self.t + r]
@@ -151,7 +151,7 @@ class VCache:
 
 
 if __name__ == "__main__":
-    from cachemir_attention import init_weights, init_input
+    from cachemir_attention_new import init_weights, init_input
 
     N, d = 8, 4
     Wv = init_weights(d, 7)

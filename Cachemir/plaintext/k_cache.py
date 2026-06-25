@@ -74,13 +74,13 @@ class KCache:
             here; the placement rotation is fused into the projection's reduce
             step.  When the offset is 0 a new ciphertext is started.
         """
-        k = np.asarray(k_positioned, dtype=np.float64)
+        k = np.asarray(k_positioned, dtype=np.int64)
         if k.shape != (self.N,):
             raise ValueError(f"k must have shape ({self.N},), got {k.shape}.")
 
         pos = self.length % self.t          # slot offset within the group
         if pos == 0:
-            self.ciphertexts.append(np.zeros(self.N, dtype=np.float64))
+            self.ciphertexts.append(np.zeros(self.N, dtype=np.int64))
         self.ciphertexts[-1] += k           # already at offset pos - no roll
         self.length += 1
 
@@ -113,7 +113,7 @@ class KCache:
             raise IndexError(f"token {i} out of range [0, {self.length}).")
         ct = self.ciphertexts[i // self.t]
         off = i % self.t
-        return np.array([ct[j * self.t + off] for j in range(self.d)], dtype=np.float64)
+        return np.array([ct[j * self.t + off] for j in range(self.d)], dtype=np.int64)
 
     def __len__(self):
         return self.length
@@ -126,7 +126,7 @@ class KCache:
 
 
 if __name__ == "__main__":
-    from cachemir_attention import init_weights
+    from cachemir_attention_new import init_weights
 
     N, d = 8, 4
     rng = np.random.default_rng(0)
