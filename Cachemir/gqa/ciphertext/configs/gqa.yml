@@ -1,0 +1,30 @@
+comment: Config for MLP from https://eprint.iacr.org/2017/396.pdf
+
+ckks_params:
+  LogN: 10
+  # LogQ: [29, 26, 26, 26, 26, 26, 26, 26]
+  # LogP: [29, 29]
+  # LogScale: 26
+  # H: 8192
+  # RingType: ConjugateInvariant
+
+  LogQ: [58, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46, 46] # [55, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40]
+  LogP: [60, 60, 60] #[61 , 61, 61]
+  LogScale: 46 #40
+  H: 192
+  RingType: standard
+
+boot_params:
+  LogP: [61, 61, 61]
+
+orion:
+  margin: 2 # >= 1
+  embedding_method: hybrid # [hybrid, square]
+  backend: lattigo # [lattigo, openfhe, heaan]
+
+  fuse_modules: true
+  debug: false
+
+  diags_path: ../data/diagonals.h5 # "path/to/diags" | ""
+  keys_path: ../data/keys.h5 # "path/to/keys" | ""
+  io_mode: none # "load" | "save" | "none"
