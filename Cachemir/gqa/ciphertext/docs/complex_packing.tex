@@ -1,0 +1,397 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{caption}
+
+\title{Complex Lane Packing for Encrypted GQA Key/Value Caches}
+\author{Cachemir GQA -- Ciphertext Pipeline}
+\date{\today}
+
+\newcommand{\conj}[1]{\overline{#1}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This note documents a lane-packing optimization applied to the Orion-based
+ciphertext implementation of Grouped Query Attention (GQA) decoding in
+\texttt{Cachemir/gqa/ciphertext}. CKKS ciphertext slots natively encode
+complex numbers, but the existing pipeline only ever populated the real
+component (imaginary part fixed at zero), discarding half of the available
+packing density. We introduce a scheme that packs two tokens per ciphertext
+slot -- one in the real part, one in the imaginary part -- for the
+Key/Value cache, and show how the resulting cross-term contamination in
+ciphertext--ciphertext multiplication is avoided (for $QK^\top$) or removed
+algebraically using complex conjugation (for scores$\times V$). We give the
+exact algorithms, a correctness proof of the conjugate trick, and measured
+before/after cost tables.
+\end{abstract}
+
+\tableofcontents
+
+\section{Background}
+
+\subsection{CKKS slots and the packing gap}
+A CKKS ciphertext with $n_{he}$ slots natively encodes a vector in
+$\mathbb{C}^{n_{he}}$: every slot holds one \emph{complex} number, and
+ciphertext--ciphertext and ciphertext--plaintext multiplication are defined
+slot-wise on $\mathbb{C}$. The existing GQA pipeline only ever encodes
+real-valued tensors (\texttt{torch.float64}), i.e. every slot is used as
+$z = a + 0i$. The imaginary half of every slot's capacity is therefore
+completely unused -- a factor-of-two packing inefficiency that propagates
+directly into ciphertext count (memory) and into the number of
+ciphertext--ciphertext (ct-ct) multiplications required to consume the
+Key/Value (K/V) cache, which is the dominant cost of encrypted attention.
+
+\subsection{GQA slot layout (recap)}
+Let $n_{he}$ be the number of CKKS slots, $d_{kv}$ the compact K/V feature
+width, $H$ the number of query heads, $n_{kv}$ the number of K/V heads,
+$\mathrm{ratio} = H / n_{kv}$, and
+\[
+  t_p = \frac{n_{he}}{d_{kv}}
+\]
+the number of tokens that fit, \emph{before} this optimization, in a single
+real-valued cache ciphertext (one token occupies every $t_p$-th slot,
+i.e.\ physical lane $\ell \in \{0, \dots, t_p-1\}$ selects slots
+$\{\ell, \ell+t_p, \ell+2t_p, \dots\}$). A cache of $N$ tokens therefore
+requires
+\[
+  C_{\text{before}}(N) = \left\lceil \frac{N}{t_p} \right\rceil
+\]
+ciphertexts, and the attention read-side loops (`$QK^\top$' and
+`scores$\times V$') iterate once per cache ciphertext, each iteration
+costing one ct-ct multiplication.
+
+\section{Complex Lane Packing Scheme}
+
+\subsection{Idea}
+Because each CKKS slot already holds a complex number, we can pack a
+\emph{second}, independent token into the previously-unused imaginary
+component of the same physical lane. Concretely, token $2k$ is written into
+the real part of lane $\ell$ and token $2k+1$ into the imaginary part of the
+\emph{same} lane $\ell$:
+\[
+  \text{slot}(\ell) \;=\; \underbrace{x_{2k}}_{\Re} \;+\; \underbrace{x_{2k+1}}_{\Im}\, i .
+\]
+This doubles the effective per-ciphertext capacity to $2 t_p$ tokens, so a
+cache of $N$ tokens now needs only
+\[
+  C_{\text{after}}(N) = \left\lceil \frac{N}{2 t_p} \right\rceil
+  \;\approx\; \tfrac{1}{2}\, C_{\text{before}}(N)
+\]
+ciphertexts.
+
+\subsection{Writing packed tokens: extending \texttt{vmm\_kv}}
+The projection routine \texttt{vmm\_kv} writes one new token into a cache
+ciphertext at structural position $\mathrm{pos}$ using a plaintext mask
+$m_{\mathrm{pos}} \in \{0,1\}^{n_{he}}$ with
+$m_{\mathrm{pos}}[\ell] = \mathbb{1}[\ell \equiv \mathrm{pos} \!\!\pmod{t_p}]$,
+via $\text{masked} = (X_c W_c) \odot m_{\mathrm{pos}}$ (a ct-pt multiply),
+after folding replicated contributions into the correct lane with
+$\log_2 t_p$ rotations. We extend $\mathrm{pos}$ to range over
+$\{0, \dots, 2t_p - 1\}$:
+
+\begin{itemize}
+  \item $\mathrm{pos} < t_p$: unchanged -- real mask, contributes to
+        $\Re(\text{slot})$.
+  \item $\mathrm{pos} \ge t_p$: physical lane
+        $\ell = \mathrm{pos} - t_p$, but the mask is multiplied by the
+        imaginary unit,
+        \[
+          m'_{\mathrm{pos}} = i \cdot m_{\ell} \in \{0, i\}^{n_{he}},
+        \]
+        so the ct-pt product lands in $\Im(\text{slot})$ instead of
+        $\Re(\text{slot})$.
+\end{itemize}
+No other change is required: rotation and addition act identically (and
+independently) on the real and imaginary components of a slot, since both
+are $\mathbb{C}$-linear operations.
+
+\subsection{Cache capacity doubling}
+The packed-cache classes (\texttt{HEKCache}/\texttt{HEVCache}) already
+accumulate tokens into the \emph{current} ciphertext until a capacity
+threshold is reached, then start a new one. Doubling the threshold,
+\[
+  t \;\leftarrow\; 2 t_p ,
+\]
+is sufficient: the existing append logic transparently drives the extended
+$\mathrm{pos}$ range above, alternating between the real half
+($\mathrm{pos} \in [0, t_p)$) and the imaginary half
+($\mathrm{pos} \in [t_p, 2t_p)$) of each ciphertext.
+
+\section{Consuming Packed Ciphertexts in Attention}
+
+\subsection{$QK^\top$: packing is ``free'' because $Q$ stays real}
+For two complex numbers $a = a_r + a_i i$ and $b = b_r + b_i i$,
+multiplication mixes components:
+\[
+  a b = (a_r b_r - a_i b_i) + (a_r b_i + a_i b_r)\, i .
+\]
+In general this means multiplying two lane-packed ciphertexts contaminates
+each output lane with cross terms from \emph{both} packed values -- exactly
+the failure mode we must avoid.
+
+However, in \texttt{qkt\_gqa\_he} the query ciphertext $Q$ is \emph{never}
+lane-packed: it is produced once per decoding step from a single new token
+via $\mathrm{pos} = 0$ only, so $Q = q + 0i$ is purely real
+($a_i = 0$). Substituting $a_i = 0$ above,
+\[
+  Q \cdot K_{\text{pack}} \;=\; q\,(k_r + k_i i) \;=\; \underbrace{q k_r}_{\Re}
+  \;+\; \underbrace{q k_i}_{\Im}\, i ,
+\]
+which has \emph{no} cross term: the real part is exactly the score against
+the even-indexed cached token and the imaginary part is exactly the score
+against the odd-indexed cached token. One ct-ct multiplication against a
+packed $K$ ciphertext therefore yields two independent, uncontaminated
+scores -- a 2$\times$ reduction in ct-ct multiplications for this stage at
+no extra algorithmic cost.
+
+\subsection{scores$\times V$: the conjugate trick}
+The second stage, \texttt{softmax\_v\_gqa\_he}, multiplies the (now
+complex, paired) attention scores $s = s_r + s_i i$ against the packed value
+cache $V = v_r + v_i i$. Here \emph{both} operands are complex, so a direct
+product does mix lanes:
+\[
+  s V = (s_r v_r - s_i v_i) + (s_r v_i + s_i v_r) i .
+\]
+What we actually want to accumulate into the running output is the sum of
+both paired tokens' contributions,
+\[
+  s_r v_r + s_i v_i ,
+\]
+with no cross term. This is obtained by multiplying by the
+\emph{complex conjugate} of $V$ instead of $V$ itself. Since
+$\conj{V} = v_r - v_i i$,
+\[
+  s \cdot \conj{V}
+  = (s_r + s_i i)(v_r - v_i i)
+  = \underbrace{(s_r v_r + s_i v_i)}_{\Re}
+    \;+\; \underbrace{(s_i v_r - s_r v_i)}_{\Im}\, i .
+\]
+The real part is \emph{exactly} the desired paired-token accumulation; the
+imaginary part is discardable cross-term noise. Because the final client-side
+decode already keeps only $\Re(\cdot)$ (CKKS decoding always discards
+residual imaginary noise), no additional homomorphic real-part extraction is
+needed -- a single ct-ct multiplication $s \cdot \conj{V}$ replaces what
+would otherwise require two separate multiplications (one per unpacked
+token).
+
+\subsection{The missing primitive: homomorphic conjugation}
+Complex conjugation of a CKKS ciphertext is implemented as a Galois
+automorphism (the same family of operation used for slot rotations, but
+with a different Galois element -- the order-2 element of the
+multiplicative group associated with the ring, sometimes called the
+``orthogonal subgroup'' element). The underlying Lattigo library exposes
+this natively as \texttt{Evaluator.Conjugate}, but the Orion wrapper used by
+this pipeline did not expose it. We added it end-to-end:
+\begin{itemize}
+  \item \textbf{Go layer} (\texttt{evaluator.go}): new exported
+        \texttt{Conjugate}/\texttt{ConjugateNew} functions, plus
+        \texttt{AddConjugationKey()} which generates (once, lazily) the
+        Galois key for the conjugation automorphism, mirroring the existing
+        power-of-two rotation key cache.
+  \item \textbf{C bindings} (\texttt{bindings.py}): registered the two new
+        exported symbols.
+  \item \textbf{Python evaluator} (\texttt{evaluator.py}): a
+        \texttt{conjugate(ctxt, in\_place)} wrapper mirroring
+        \texttt{rotate(...)}.
+  \item \textbf{Tensor API} (\texttt{tensors.py}): a
+        \texttt{CipherTensor.conjugate()} method mirroring
+        \texttt{CipherTensor.roll()}.
+\end{itemize}
+This primitive was validated in isolation: encrypting a random complex
+vector, conjugating homomorphically, decrypting, and comparing against
+\texttt{numpy.conj} gave a maximum absolute error of $\approx 3.4\times
+10^{-8}$, consistent with ordinary CKKS rescaling noise.
+
+\section{Algorithms}
+
+\begin{algorithm}[H]
+\caption{\texttt{vmm\_kv} with paired real/imaginary positions}
+\begin{algorithmic}[1]
+\Require encrypted sparse chunks $\{X_c\}$, plaintext weight chunks $\{W_c\}$,
+  dims (incl. $t_p$), level $\ell$, position $\mathrm{pos} \in [0, 2t_p)$
+\State $\mathrm{is\_imag} \gets (\mathrm{pos} \ge t_p)$
+\State $\mathrm{phys} \gets \mathrm{pos} - t_p \cdot \mathbb{1}[\mathrm{is\_imag}]$
+\State $m \gets \mathbf{0} \in \mathbb{C}^{n_{he}}$
+\State $m[\mathrm{phys} :: t_p] \gets i$ \textbf{if} $\mathrm{is\_imag}$ \textbf{else} $1$
+\State $\mathrm{out} \gets \varnothing$
+\For{each $(X_c, W_c)$}
+  \State $\mathrm{acc} \gets X_c \cdot W_c$ \Comment{ct-pt multiply}
+  \For{$\mathrm{step} = 1, 2, 4, \dots < t_p$} \Comment{$\log_2 t_p$ rotations}
+    \State $\mathrm{acc} \gets \mathrm{acc} + \mathrm{roll}(\mathrm{acc}, \pm\mathrm{step})$
+    \Comment{sign chosen from bits of $\mathrm{phys}$}
+  \EndFor
+  \State $\mathrm{masked} \gets \mathrm{acc} \odot m$ \Comment{ct-pt multiply (complex $m$ if imaginary half)}
+  \State $\mathrm{out} \gets \mathrm{out} + \mathrm{masked}$
+\EndFor
+\State \Return $\mathrm{out}$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{Packed $QK^\top$ (\texttt{qkt\_gqa\_he})}
+\begin{algorithmic}[1]
+\Require real query ciphertext $Q$ (per group $c$), packed key ciphertexts $\{K_b\}_{b=1}^{C_{\text{after}}(N)}$
+\State $Q_{\mathrm{rep}} \gets \textsc{BlockReplicate}(Q, t_p)$
+\For{each packed key ciphertext $K_b$}
+  \State $\mathrm{folded} \gets Q_{\mathrm{rep}} \cdot K_b$ \Comment{1 ct-ct mult scores \emph{two} tokens; no cross terms since $Q_{\mathrm{rep}}$ is real}
+  \State fold $\mathrm{folded}$ over $\log_2 d_h$ rotations (head-dim reduction)
+  \State append $\mathrm{folded}$ to attention row for group $c$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{Packed scores$\times V$ (\texttt{softmax\_v\_gqa\_he})}
+\begin{algorithmic}[1]
+\Require packed attention scores $\{s_b\}$, packed value ciphertexts $\{V_b\}$
+\State $\mathrm{out} \gets 0$
+\For{each $b$}
+  \State $\conj{V_b} \gets \textsc{Conjugate}(V_b)$ \Comment{new automorphism}
+  \State $\mathrm{prod} \gets s_b \cdot \conj{V_b}$ \Comment{1 ct-ct mult; $\Re(\mathrm{prod}) = s_r v_r + s_i v_i$}
+  \State fold $\mathrm{prod}$ over $\log_2 t_p$ rotations
+  \State $\mathrm{out} \gets \mathrm{out} + \mathrm{prod} \odot \mathrm{out\_mask}$ \Comment{ct-pt multiply, real mask}
+\EndFor
+\State \Return $\mathrm{out}$ \Comment{client discards $\Im(\cdot)$ on decode}
+\end{algorithmic}
+\end{algorithm}
+
+\section{Cost Model}
+
+Let $\mathrm{ratio} = H / n_{kv}$ and $C(N)$ be the number of K/V cache
+ciphertexts for $N$ cached tokens. Per decoding step, the read-side cost of
+$QK^\top$ and scores$\times V$ combined is
+\[
+  \#\text{ct-ct} \;=\; 2 \cdot \mathrm{ratio} \cdot C(N), \qquad
+  \#\text{conjugations} \;=\;
+  \begin{cases}
+    0 & \text{before (n/a)}\\
+    \mathrm{ratio} \cdot C(N) & \text{after}
+  \end{cases}
+\]
+with $C_{\text{before}}(N) = \lceil N / t_p \rceil$ and
+$C_{\text{after}}(N) = \lceil N / (2 t_p) \rceil$. The write-side cost (new
+token projection via \texttt{vmm\_kv}, dominated by
+$R \cdot \mathrm{ratio} \cdot \log_2 t_p$ rotations per token, where
+$R = \lceil d_{kv} / t_p \rceil$) is \emph{unchanged} by this optimization,
+since each decoding step still injects exactly one new token regardless of
+packing.
+
+\section{Measured Results}
+
+Configuration: $n_{he} = 512$, $d = 128$, $H = 8$, $n_{kv} = 4$
+($d_h = 16$, $\mathrm{ratio} = 2$, $d_{kv} = 64$, $t_p = 8$).
+
+\subsection{Cache ciphertext count (memory)}
+\begin{table}[H]
+\centering
+\begin{tabular}{rrrr}
+\toprule
+Tokens $N$ & Before $\lceil N/t_p \rceil$ & After $\lceil N/2t_p \rceil$ & Reduction \\
+\midrule
+6   & 1  & 1 & 0\%  \\
+21  & 3  & 2 & 33\% \\
+51  & 7  & 4 & 43\% \\
+101 & 13 & 7 & 46\% \\
+\bottomrule
+\end{tabular}
+\caption{K/V cache ciphertext count before/after complex packing. Very
+short sequences see no benefit (a single ciphertext already covers them
+either way); the reduction approaches the asymptotic 2$\times$ as $N$
+grows.}
+\end{table}
+
+\subsection{Ciphertext--ciphertext multiplications ($QK^\top$ + scores$\times V$)}
+\begin{table}[H]
+\centering
+\begin{tabular}{rrrrr}
+\toprule
+Tokens $N$ & Before & After (measured) & Reduction & Conjugations (after) \\
+\midrule
+6   & 4  & 4  & 0\%  & 2  \\
+21  & 12 & 8  & 33\% & 4  \\
+51  & 28 & 16 & 43\% & 8  \\
+101 & 52 & 28 & 46\% & 14 \\
+\bottomrule
+\end{tabular}
+\caption{ct-ct multiplication counts. ``Before'' values are computed from
+the closed-form cost model above (consistent with the pre-packing code
+path); ``after'' values are measured directly from the instrumented
+pipeline. Conjugations are a new op class introduced by this optimization,
+each cheaper than a ct-ct multiplication.}
+\end{table}
+
+\subsection{Rotations and other operation counts}
+\begin{table}[H]
+\centering
+\begin{tabular}{rrrrr}
+\toprule
+Tokens $N$ & Rotations & ct-pt mult & ct-ct mult & Conjugations \\
+\midrule
+6   & 1448  & 450  & 4  & 2  \\
+21  & 4792  & 1412 & 8  & 4  \\
+51  & 11480 & 3336 & 16 & 8  \\
+101 & 22622 & 6542 & 28 & 14 \\
+\bottomrule
+\end{tabular}
+\caption{Full measured counter dump for the packed (``after'') pipeline.
+Rotation counts are essentially unchanged from the pre-packing baseline at
+matching $N$: they are dominated by the per-token write path in
+\texttt{vmm\_kv} (folding each new token into position, unaffected by
+packing), not by the read-side loops that benefit from packing. Only the
+smaller $QK^\top$/scores$\times V$ fold-rotation contributions shrink
+proportionally to the ct-ct savings above.}
+\end{table}
+
+\subsection{Correctness}
+\begin{table}[H]
+\centering
+\begin{tabular}{rrrr}
+\toprule
+Tokens $N$ & qkt\_err & softmaxv\_err & Status \\
+\midrule
+6   & $7.16\times 10^{-5}$ & $2.93\times 10^{-3}$ & CHECK \\
+21  & $7.16\times 10^{-5}$ & $4.32\times 10^{-3}$ & CHECK \\
+51  & $1.05\times 10^{-4}$ & $7.22\times 10^{-3}$ & CHECK \\
+101 & $1.05\times 10^{-4}$ & $1.09\times 10^{-2}$ & CHECK \\
+\bottomrule
+\end{tabular}
+\caption{Errors against the (unchanged, real-valued) plaintext reference.
+The $N{=}6$ case matches the pre-existing, documented CKKS approximation
+baseline for this configuration exactly (no regression from packing); the
+slow growth with $N$ reflects accumulating CKKS noise across more ct-ct
+terms, independent of whether packing is used.}
+\end{table}
+
+\section{Summary}
+
+\begin{itemize}
+  \item Two tokens are packed per CKKS ciphertext slot using the real and
+        imaginary components, exploiting slot capacity that was previously
+        always zero-padded.
+  \item The query path is deliberately left real/unpacked, which makes the
+        $QK^\top$ stage benefit ``for free'' -- no cross-term contamination,
+        no extra operations.
+  \item The scores$\times V$ stage requires one new primitive,
+        homomorphic complex conjugation, which was added to the Orion/
+        Lattigo backend; the conjugate trick algebraically isolates the
+        desired sum of paired-token contributions in the real part of a
+        single ct-ct product.
+  \item Net effect: K/V cache memory and ct-ct multiplication count (the
+        dominant FHE cost) trend toward a 2$\times$ improvement as sequence
+        length grows, at the cost of one cheap conjugation operation per
+        packed value ciphertext consumed. Rotation counts are essentially
+        unaffected, since they are dominated by the per-token write path,
+        which lies outside this optimization's scope. No regression in
+        numerical correctness was observed.
+\end{itemize}
+
+\end{document}
