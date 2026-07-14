@@ -73,6 +73,74 @@ def softmax_v_gqa(att_cts: np.ndarray, vcache: VCache, dims: GQADims) -> np.ndar
     return O_ct
 
 
+
+def softmax_gqa(att_cts: np.ndarray, dims: GQADims, n_tokens: int) -> np.ndarray:
+    """Row-softmax over the token axis, independently per (query-group c, kv-head)."""
+    ratio, n_b, n_he = att_cts.shape
+    t_p, B, n_kv = dims.t_p, dims.B, dims.n_kv
+    out = np.zeros_like(att_cts)
+    
+    # valid tokens in the last ciphertext
+    rem = n_tokens - (n_b - 1) * t_p  
+
+    # valid mask for the last ciphertext for a single block - needs to be replicated in the ciphertext (done by np.tile)
+    base_valid = np.zeros(B, dtype=np.float64)
+    for kv in range(n_kv):
+        base_valid[kv * t_p: kv * t_p + rem] = 1.0
+    valid_last = np.tile(base_valid, n_he // B)
+
+    # mask keeping exactly one base slot per lane (for isolating summation fold results)
+    base_reduce = np.zeros(B, dtype=np.float64)
+    base_reduce[::t_p] = 1.0
+    reduce_mask = np.tile(base_reduce, n_he // B)
+
+    for c in range(ratio):
+        # per-lane max, computed for ALL kv at once via reshape (no kv loop) - this is not supported in FHE (needes to be changed)
+        lane_max = np.stack(
+            [att_cts[c, b][:B].reshape(n_kv, t_p).max(axis=1) for b in range(n_b - 1)]
+            + [np.where(
+                base_valid.reshape(n_kv, t_p) > 0,
+                att_cts[c, n_b - 1][:B].reshape(n_kv, t_p),
+                -np.inf,
+              ).max(axis=1)]
+        ).max(axis=0)  # shape (n_kv,)
+
+        # broadcast each lane's max to its own t_p slots, tiled over d_h blocks
+        row_max = np.tile(np.repeat(lane_max, t_p), n_he // B)
+
+        # mask AFTER exp only -- padding slots are literal zeros from the
+        # cache (never-written), not adversarial values, so they can't
+        # overflow exp; no need to mask before
+        # exponentiate -- every slot subtracts its OWN lane's max, so no overflow
+        exp_cts = []
+        for b in range(n_b):
+            e = np.exp(att_cts[c, b] - row_max)
+            if b == n_b - 1:
+                e = e * valid_last
+            exp_cts.append(e)
+
+
+        # fold: all lanes fold correctly in parallel (verified: lane boundaries
+        # align exactly with the rotation steps, so no cross-lane leakage)
+        denom_isolated = np.zeros(n_he, dtype=np.float64)
+        for e in exp_cts:
+            acc = e.copy()
+            step = 1
+            while step < t_p:
+                counter.rotations += 1
+                acc = acc + np.roll(acc, -step)
+                step *= 2
+            denom_isolated += acc * reduce_mask
+
+        denom = block_replicate(denom_isolated, t_p)
+        inv_denom = np.where(denom > 0, 1.0 / denom, 0.0)
+
+        for b in range(n_b):
+            out[c, b] = exp_cts[b] * inv_denom
+
+    return out
+
+
 def attention_gqa(
     X_enc_chunks: List[np.ndarray],
     kcache: KCache,
@@ -94,8 +162,9 @@ def attention_gqa(
     vcache.append(V_new)
 
     att_cts = qkt_gqa(Q_cts, kcache.ciphertexts, dims)
-    O = softmax_v_gqa(att_cts, vcache, dims)
-    return Q_cts, K_new, V_new, att_cts, O
+    smax_cts = softmax_gqa(att_cts, dims, n_tokens=len(kcache))
+    O = softmax_v_gqa(smax_cts, vcache, dims)
+    return Q_cts, K_new, V_new, att_cts, smax_cts, O
 
 
 def run_attention_gqa(
@@ -125,12 +194,17 @@ def run_attention_gqa(
         vcache.append(vmm_kv(xc, Wv_enc, dims, pos=len(vcache) % dims.t_p))
 
     x_new = init_input(dims.d, seed=seeds[3])
+    # print("x_new" , x_new)
     x_sparse = make_sparse_input_kv(x_new, dims)
+    # print("len sparse:" , x_sparse)
     xc_new = expand_sparse_input_kv_plain(x_sparse, dims)
+    # print("len expanded:" , xc_new)
+    # print("input without encodong:" , x_sparse)
 
-    Q_cts, K_new, V_new, att_cts, O = attention_gqa(
+    Q_cts, K_new, V_new, att_cts, smax_cts, O = attention_gqa(
         xc_new, kcache, vcache, Wq_enc_list, Wk_enc, Wv_enc, dims
     )
+    # print("output :" , len(O))
 
     err_qkt, err_v = compare_attention_outputs(
         toks=toks,
