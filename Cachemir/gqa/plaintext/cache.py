@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import List
 
-import numpy as np
+import torch
 
 from .dims import check_dims, normalize_heads
 
@@ -19,7 +19,7 @@ class PackedCache:
         self.N = N
         self.d = d
         self.t = N // d
-        self.ciphertexts: List[np.ndarray] = []
+        self.ciphertexts: List[torch.Tensor] = []
         self.length = 0
 
     @property
@@ -27,28 +27,28 @@ class PackedCache:
         return len(self.ciphertexts)
 
     @property
-    def blocks(self) -> List[np.ndarray]:
+    def blocks(self) -> List[torch.Tensor]:
         return self.ciphertexts
 
-    def append(self, positioned: np.ndarray) -> None:
-        value = np.asarray(positioned, dtype=np.float64)
-        if value.shape != (self.N,):
-            raise ValueError(f"value must have shape ({self.N},), got {value.shape}.")
+    def append(self, positioned: torch.Tensor) -> None:
+        value = torch.as_tensor(positioned, dtype=torch.float64)
+        if tuple(value.shape) != (self.N,):
+            raise ValueError(f"value must have shape ({self.N},), got {tuple(value.shape)}.")
 
         pos = self.length % self.t
         if pos == 0:
-            self.ciphertexts.append(np.zeros(self.N, dtype=np.float64))
+            self.ciphertexts.append(torch.zeros(self.N, dtype=torch.float64))
 
         self.ciphertexts[-1] += value
         self.length += 1
 
-    def get_token(self, i: int) -> np.ndarray:
+    def get_token(self, i: int) -> torch.Tensor:
         if not 0 <= i < self.length:
             raise IndexError(f"token {i} out of range [0, {self.length}).")
 
         ct = self.ciphertexts[i // self.t]
         tok_in_ct = i % self.t
-        return np.array([ct[g * self.t + tok_in_ct] for g in range(self.d)], dtype=np.float64)
+        return torch.stack([ct[g * self.t + tok_in_ct] for g in range(self.d)])
 
     def __len__(self) -> int:
         return self.length

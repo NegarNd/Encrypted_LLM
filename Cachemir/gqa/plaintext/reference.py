@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from typing import Callable, List
-import numpy as np
+import torch
 from .dims import GQADims
 
 
-def decode_attention_map(att_cts: np.ndarray, n_tokens: int, dims: GQADims) -> np.ndarray:
+def decode_attention_map(att_cts: torch.Tensor, n_tokens: int, dims: GQADims) -> torch.Tensor:
     """Decode structural attention scores into a dense H x n_tokens map."""
-    decoded = np.zeros((dims.H, n_tokens), dtype=np.float64)
+    decoded = torch.zeros((dims.H, n_tokens), dtype=torch.float64)
 
     for c in range(dims.ratio):
         for b in range(att_cts.shape[1]):
@@ -25,9 +25,9 @@ def decode_attention_map(att_cts: np.ndarray, n_tokens: int, dims: GQADims) -> n
     return decoded
 
 
-def decode_output(O: np.ndarray, dims: GQADims) -> np.ndarray:
+def decode_output(O: torch.Tensor, dims: GQADims) -> torch.Tensor:
     """Decode output ciphertexts into dense H x d_h values."""
-    O_dense = np.zeros((dims.H, dims.d_h), dtype=np.float64)
+    O_dense = torch.zeros((dims.H, dims.d_h), dtype=torch.float64)
 
     for c in range(dims.ratio):
         for kv in range(dims.n_kv):
@@ -37,47 +37,47 @@ def decode_output(O: np.ndarray, dims: GQADims) -> np.ndarray:
 
     return O_dense
 
-def _softmax(x: np.ndarray) -> np.ndarray:
-    e = np.exp(x - np.max(x))
-    return e / np.sum(e)
+def _softmax(x: torch.Tensor) -> torch.Tensor:
+    e = torch.exp(x - torch.max(x))
+    return e / torch.sum(e)
 
 def reference_attention(
-    toks: List[np.ndarray],
-    x_new: np.ndarray,
-    Wq_raw: np.ndarray,
-    Wk_raw: np.ndarray,
-    Wv_raw: np.ndarray,
+    toks: List[torch.Tensor],
+    x_new: torch.Tensor,
+    Wq_raw: torch.Tensor,
+    Wk_raw: torch.Tensor,
+    Wv_raw: torch.Tensor,
     dims: GQADims,
     head_perm: Callable[[int, int], list[int]],
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute dense reference QK^T and scores*V results."""
     all_toks = toks + [x_new]
     n_tokens = len(all_toks)
     perm_kv = head_perm(dims.d_kv, dims.n_kv)
 
-    K_matrix = np.array([x @ Wk_raw[:, perm_kv] for x in all_toks]).T
-    V_matrix = np.array([x @ Wv_raw[:, perm_kv] for x in all_toks])
+    K_matrix = torch.stack([x @ Wk_raw[:, perm_kv] for x in all_toks]).T
+    V_matrix = torch.stack([x @ Wv_raw[:, perm_kv] for x in all_toks])
 
     Qf = x_new @ Wq_raw
 
-    ref_map = np.zeros((dims.H, n_tokens), dtype=np.float64)
+    ref_map = torch.zeros((dims.H, n_tokens), dtype=torch.float64)
     for h in range(dims.H):
         kv = h // dims.ratio
         for tok in range(n_tokens):
             for i in range(dims.d_h):
                 ref_map[h, tok] += Qf[h * dims.d_h + i] * K_matrix[i * dims.n_kv + kv, tok]
 
-    def score(h: int, tok: int) -> float:
+    def score(h: int, tok: int) -> torch.Tensor:
         kv = h // dims.ratio
         return sum(
             Qf[h * dims.d_h + i] * K_matrix[i * dims.n_kv + kv, tok]
             for i in range(dims.d_h)
         )
 
-    ref_O = np.zeros((dims.H, dims.d_h), dtype=np.float64)
+    ref_O = torch.zeros((dims.H, dims.d_h), dtype=torch.float64)
     for h in range(dims.H):
         kv = h // dims.ratio
-        scores = np.array([score(h, tok) for tok in range(n_tokens)])
+        scores = torch.stack([score(h, tok) for tok in range(n_tokens)])
         weights = _softmax(scores)
         for dim in range(dims.d_h):
             g = dim * dims.n_kv + kv
@@ -87,13 +87,13 @@ def reference_attention(
 
 
 def compare_attention_outputs(
-    toks: List[np.ndarray],
-    x_new: np.ndarray,
-    Wq_raw: np.ndarray,
-    Wk_raw: np.ndarray,
-    Wv_raw: np.ndarray,
-    att_cts: np.ndarray,
-    O: np.ndarray,
+    toks: List[torch.Tensor],
+    x_new: torch.Tensor,
+    Wq_raw: torch.Tensor,
+    Wk_raw: torch.Tensor,
+    Wv_raw: torch.Tensor,
+    att_cts: torch.Tensor,
+    O: torch.Tensor,
     dims: GQADims,
     head_perm: Callable[[int, int], list[int]],
 ) -> tuple[float, float]:
@@ -102,4 +102,4 @@ def compare_attention_outputs(
     decoded_map = decode_attention_map(att_cts, n_tokens, dims)
     O_dense = decode_output(O, dims)
     ref_map, ref_O = reference_attention(toks, x_new, Wq_raw, Wk_raw, Wv_raw, dims, head_perm)
-    return float(np.max(np.abs(decoded_map - ref_map))), float(np.max(np.abs(O_dense - ref_O)))
+    return float(torch.max(torch.abs(decoded_map - ref_map))), float(torch.max(torch.abs(O_dense - ref_O)))

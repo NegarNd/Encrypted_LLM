@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 from typing import List, Tuple
-import numpy as np
+import torch
 
 from .dims import (
     GQADims,
@@ -11,18 +11,18 @@ from .dims import (
     normalize_heads,
 )
 
-from .counter import counter 
+from .counter import counter
 
-def init_input(d: int, seed: int = 0) -> np.ndarray:
+def init_input(d: int, seed: int = 0) -> torch.Tensor:
     """Generate a random dense input vector X of length d."""
-    rng = np.random.default_rng(seed)
-    return rng.standard_normal(d)
+    gen = torch.Generator().manual_seed(seed)
+    return torch.randn(d, generator=gen, dtype=torch.float64)
 
 
-def init_weights(d: int, seed: int = 1) -> np.ndarray:
+def init_weights(d: int, seed: int = 1) -> torch.Tensor:
     """Generate a random dense square weight matrix."""
-    rng = np.random.default_rng(seed)
-    return rng.standard_normal((d, d))
+    gen = torch.Generator().manual_seed(seed)
+    return torch.randn((d, d), generator=gen, dtype=torch.float64)
 
 
 def head_perm(d: int, H: int) -> List[int]:
@@ -46,7 +46,7 @@ def gqa_q_perm(dims: GQADims, c: int) -> List[int]:
 
 
 
-def make_sparse_input_kv(X: np.ndarray, dims: GQADims) -> List[np.ndarray]:
+def make_sparse_input_kv(X: torch.Tensor, dims: GQADims) -> List[torch.Tensor]:
     """Create sparse GQA input vectors.
 
     This is the client-side plaintext packing only.
@@ -58,10 +58,10 @@ def make_sparse_input_kv(X: np.ndarray, dims: GQADims) -> List[np.ndarray]:
         sparse[g * t_p] = X[gqa_group_input_index(c, g, dims)]
         all other slots are zero.
     """
-    sparse_inputs: List[np.ndarray] = []
+    sparse_inputs: List[torch.Tensor] = []
 
     for c in range(dims.ratio):
-        enc = np.zeros(dims.n_he, dtype=np.float64)
+        enc = torch.zeros(dims.n_he, dtype=torch.float64)
 
         for g in range(dims.d_kv):
             slot = g * dims.t_p
@@ -74,23 +74,23 @@ def make_sparse_input_kv(X: np.ndarray, dims: GQADims) -> List[np.ndarray]:
 
 
 def expand_sparse_input_kv_plain(
-    sparse_inputs: List[np.ndarray], dims: GQADims
-) -> List[np.ndarray]:
+    sparse_inputs: List[torch.Tensor], dims: GQADims
+) -> List[torch.Tensor]:
     """Plaintext simulator for the HE rotations used to expand sparse X.
     """
     lane_offsets = gqa_lane_offsets(dims)
-    chunks: List[np.ndarray] = []
+    chunks: List[torch.Tensor] = []
 
     for sparse in sparse_inputs:
         for start in range(0, dims.d_kv, dims.t_p):
             offsets = lane_offsets[start : start + dims.t_p]
 
-            acc = np.zeros(dims.n_he, dtype=np.float64)
+            acc = torch.zeros(dims.n_he, dtype=torch.float64)
 
             for lane, off in enumerate(offsets):
                 shift = off * dims.t_p - lane
                 counter.rotations +=1
-                acc += np.roll(sparse, -shift)
+                acc += torch.roll(sparse, -shift)
 
             chunks.append(acc)
 
@@ -98,17 +98,17 @@ def expand_sparse_input_kv_plain(
 
 def make_weights_kv(
     dims: GQADims, seed: int = 1
-) -> Tuple[np.ndarray, List[np.ndarray]]:
+) -> Tuple[torch.Tensor, List[torch.Tensor]]:
     """Generate and encode a compact GQA K/V projection matrix."""
-    rng = np.random.default_rng(seed)
-    W = rng.standard_normal((dims.d, dims.d_kv))
+    gen = torch.Generator().manual_seed(seed)
+    W = torch.randn((dims.d, dims.d_kv), generator=gen, dtype=torch.float64)
     lane_offsets = gqa_lane_offsets(dims)
 
-    chunks_enc: List[np.ndarray] = []
+    chunks_enc: List[torch.Tensor] = []
     for c in range(dims.ratio):
         for start in range(0, dims.d_kv, dims.t_p):
             offsets = lane_offsets[start : start + dims.t_p]
-            enc = np.zeros(dims.n_he, dtype=np.float64)
+            enc = torch.zeros(dims.n_he, dtype=torch.float64)
             for g in range(dims.d_kv):
                 col = gqa_kv_group_col(g, dims)
                 base = g * dims.t_p
@@ -123,19 +123,19 @@ def make_weights_kv(
 
 def make_weights_q_gqa(
     dims: GQADims, seed: int = 1
-) -> Tuple[np.ndarray, List[List[np.ndarray]]]:
+) -> Tuple[torch.Tensor, List[List[torch.Tensor]]]:
     """Generate and encode the full Q projection for GQA."""
     Wq = init_weights(dims.d, seed)
     lane_offsets = gqa_lane_offsets(dims)
 
-    encs: List[List[np.ndarray]] = []
+    encs: List[List[torch.Tensor]] = []
     for c_out in range(dims.ratio):
-        chunks_enc: List[np.ndarray] = []
+        chunks_enc: List[torch.Tensor] = []
         q_perm = gqa_q_perm(dims, c_out)
         for c_in in range(dims.ratio):
             for start in range(0, dims.d_kv, dims.t_p):
                 offsets = lane_offsets[start : start + dims.t_p]
-                enc = np.zeros(dims.n_he, dtype=np.float64)
+                enc = torch.zeros(dims.n_he, dtype=torch.float64)
                 for g in range(dims.d_kv):
                     col = q_perm[g]
                     base = g * dims.t_p

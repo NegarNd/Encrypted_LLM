@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import math
 from typing import List, Tuple
 
-import numpy as np
+import torch
 
 from .cache import KCache, VCache
 from .dims import GQAConfig, GQADims, make_gqa_dims
@@ -22,19 +23,19 @@ from .counter import counter
 
 
 def vmm_q_gqa(
-    X_enc_chunks: List[np.ndarray], Wq_enc_list: List[List[np.ndarray]], dims: GQADims
-) -> np.ndarray:
+    X_enc_chunks: List[torch.Tensor], Wq_enc_list: List[List[torch.Tensor]], dims: GQADims
+) -> torch.Tensor:
     """Compute Q ciphertexts in sparse canonical layout."""
-    Q_cts = np.zeros((dims.ratio, dims.n_he), dtype=np.float64)
+    Q_cts = torch.zeros((dims.ratio, dims.n_he), dtype=torch.float64)
     for c in range(dims.ratio):
         Q_cts[c] = vmm_kv(X_enc_chunks, Wq_enc_list[c], dims, pos=0)
     return Q_cts
 
 
-def qkt_gqa(Q_cts: np.ndarray, k_ciphertexts: List[np.ndarray], dims: GQADims) -> np.ndarray:
+def qkt_gqa(Q_cts: torch.Tensor, k_ciphertexts: List[torch.Tensor], dims: GQADims) -> torch.Tensor:
     """Compute structural QK^T scores against cached keys."""
-    fold_nsteps = int(np.log2(dims.d_h))
-    att_cts = np.zeros((dims.ratio, len(k_ciphertexts), dims.n_he), dtype=np.float64)
+    fold_nsteps = int(math.log2(dims.d_h))
+    att_cts = torch.zeros((dims.ratio, len(k_ciphertexts), dims.n_he), dtype=torch.float64)
 
     for c in range(dims.ratio):
         Q_rep = block_replicate(Q_cts[c], dims.t_p)
@@ -44,18 +45,18 @@ def qkt_gqa(Q_cts: np.ndarray, k_ciphertexts: List[np.ndarray], dims: GQADims) -
             step = dims.B
             for _ in range(fold_nsteps):
                 counter.rotations += 1
-                folded = folded + np.roll(folded, -step)
+                folded = folded + torch.roll(folded, -step)
                 step *= 2
             att_cts[c, b] = folded
 
     return att_cts
 
 
-def softmax_v_gqa(att_cts: np.ndarray, vcache: VCache, dims: GQADims) -> np.ndarray:
+def softmax_v_gqa(att_cts: torch.Tensor, vcache: VCache, dims: GQADims) -> torch.Tensor:
     """Compute scores times V. Softmax approximation is intentionally omitted."""
-    out_mask = np.zeros(dims.n_he, dtype=np.float64)
+    out_mask = torch.zeros(dims.n_he, dtype=torch.float64)
     out_mask[:: dims.t_p] = 1.0
-    O_ct = np.zeros((dims.ratio, dims.n_he), dtype=np.float64)
+    O_ct = torch.zeros((dims.ratio, dims.n_he), dtype=torch.float64)
 
     for c in range(dims.ratio):
         for b in range(att_cts.shape[1]):
@@ -66,7 +67,7 @@ def softmax_v_gqa(att_cts: np.ndarray, vcache: VCache, dims: GQADims) -> np.ndar
             step = 1
             while step < dims.t_p:
                 counter.rotations += 1
-                prod = prod + np.roll(prod, -step)
+                prod = prod + torch.roll(prod, -step)
                 step *= 2
             O_ct[c] += prod * out_mask
 
@@ -74,47 +75,54 @@ def softmax_v_gqa(att_cts: np.ndarray, vcache: VCache, dims: GQADims) -> np.ndar
 
 
 
-def softmax_gqa(att_cts: np.ndarray, dims: GQADims, n_tokens: int) -> np.ndarray:
+def softmax_gqa(att_cts: torch.Tensor, dims: GQADims, n_tokens: int) -> torch.Tensor:
     """Row-softmax over the token axis, independently per (query-group c, kv-head)."""
     ratio, n_b, n_he = att_cts.shape
     t_p, B, n_kv = dims.t_p, dims.B, dims.n_kv
-    out = np.zeros_like(att_cts)
-    
-    # valid tokens in the last ciphertext
-    rem = n_tokens - (n_b - 1) * t_p  
+    out = torch.zeros_like(att_cts)
 
-    # valid mask for the last ciphertext for a single block - needs to be replicated in the ciphertext (done by np.tile)
-    base_valid = np.zeros(B, dtype=np.float64)
+    # valid tokens in the last ciphertext
+    rem = n_tokens - (n_b - 1) * t_p
+
+    # valid mask for the last ciphertext for a single block - needs to be replicated in the ciphertext (done by tile)
+    base_valid = torch.zeros(B, dtype=torch.float64)
     for kv in range(n_kv):
         base_valid[kv * t_p: kv * t_p + rem] = 1.0
-    valid_last = np.tile(base_valid, n_he // B)
+    valid_last = base_valid.tile(n_he // B)
 
     # mask keeping exactly one base slot per lane (for isolating summation fold results)
-    base_reduce = np.zeros(B, dtype=np.float64)
+    base_reduce = torch.zeros(B, dtype=torch.float64)
     base_reduce[::t_p] = 1.0
-    reduce_mask = np.tile(base_reduce, n_he // B)
+    reduce_mask = base_reduce.tile(n_he // B)
 
     for c in range(ratio):
         # per-lane max, computed for ALL kv at once via reshape (no kv loop) - this is not supported in FHE (needes to be changed)
-        lane_max = np.stack(
-            [att_cts[c, b][:B].reshape(n_kv, t_p).max(axis=1) for b in range(n_b - 1)]
-            + [np.where(
-                base_valid.reshape(n_kv, t_p) > 0,
-                att_cts[c, n_b - 1][:B].reshape(n_kv, t_p),
-                -np.inf,
-              ).max(axis=1)]
-        ).max(axis=0)  # shape (n_kv,)
+        last_block = att_cts[c, n_b - 1][:B].reshape(n_kv, t_p)
+        last_valid = base_valid.reshape(n_kv, t_p) > 0
+        lane_max = torch.stack(
+            [att_cts[c, b][:B].reshape(n_kv, t_p).max(dim=1).values for b in range(n_b - 1)]
+            + [torch.where(
+                last_valid,
+                last_block,
+                torch.full_like(last_block, -float("inf")),
+              ).max(dim=1).values]
+        ).max(dim=0).values  # shape (n_kv,)
 
         # broadcast each lane's max to its own t_p slots, tiled over d_h blocks
-        row_max = np.tile(np.repeat(lane_max, t_p), n_he // B)
+        row_max = lane_max.repeat_interleave(t_p).tile(n_he // B)
 
-        # mask AFTER exp only -- padding slots are literal zeros from the
-        # cache (never-written), not adversarial values, so they can't
-        # overflow exp; no need to mask before
-        # exponentiate -- every slot subtracts its OWN lane's max, so no overflow
+        # mask the padding slots of the last block to 0 BEFORE exp: raw
+        # attention scores are unscaled dot products and can be large in
+        # magnitude, so exp(padding_value - row_max) can overflow to inf if
+        # left unmasked; forcing the diff to exactly 0 keeps exp bounded
+        # (exp(0) == 1). Masking again AFTER exp zeroes those 1s back out so
+        # they don't pollute the denominator sum below.
         exp_cts = []
         for b in range(n_b):
-            e = np.exp(att_cts[c, b] - row_max)
+            diff = att_cts[c, b] - row_max
+            if b == n_b - 1:
+                diff = diff * valid_last
+            e = torch.exp(diff)
             if b == n_b - 1:
                 e = e * valid_last
             exp_cts.append(e)
@@ -122,18 +130,18 @@ def softmax_gqa(att_cts: np.ndarray, dims: GQADims, n_tokens: int) -> np.ndarray
 
         # fold: all lanes fold correctly in parallel (verified: lane boundaries
         # align exactly with the rotation steps, so no cross-lane leakage)
-        denom_isolated = np.zeros(n_he, dtype=np.float64)
+        denom_isolated = torch.zeros(n_he, dtype=torch.float64)
         for e in exp_cts:
-            acc = e.copy()
+            acc = e.clone()
             step = 1
             while step < t_p:
                 counter.rotations += 1
-                acc = acc + np.roll(acc, -step)
+                acc = acc + torch.roll(acc, -step)
                 step *= 2
             denom_isolated += acc * reduce_mask
 
         denom = block_replicate(denom_isolated, t_p)
-        inv_denom = np.where(denom > 0, 1.0 / denom, 0.0)
+        inv_denom = torch.where(denom > 0, 1.0 / denom, torch.zeros_like(denom))
 
         for b in range(n_b):
             out[c, b] = exp_cts[b] * inv_denom
@@ -142,14 +150,14 @@ def softmax_gqa(att_cts: np.ndarray, dims: GQADims, n_tokens: int) -> np.ndarray
 
 
 def attention_gqa(
-    X_enc_chunks: List[np.ndarray],
+    X_enc_chunks: List[torch.Tensor],
     kcache: KCache,
     vcache: VCache,
-    Wq_enc_list: List[List[np.ndarray]],
-    Wk_enc: List[np.ndarray],
-    Wv_enc: List[np.ndarray],
+    Wq_enc_list: List[List[torch.Tensor]],
+    Wk_enc: List[torch.Tensor],
+    Wv_enc: List[torch.Tensor],
     dims: GQADims,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Execute one GQA decoding step."""
     Q_cts = vmm_q_gqa(X_enc_chunks, Wq_enc_list, dims)
 
