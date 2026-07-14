@@ -71,7 +71,15 @@ def vmm_kv(
     level: int,
     pos: int = 0,
     ) -> Tuple[Any, int]:
-    """Compact GQA K/V or Q projection over encrypted sparse chunks."""
+    """Compact GQA K/V or Q projection over encrypted sparse chunks.
+
+    `pos` ranges over `[0, 2*dims.t_p)`. Positions `< t_p` land in the real
+    part of physical lane `pos` (as before). Positions `>= t_p` land in the
+    *imaginary* part of physical lane `pos - t_p`, packing a second,
+    independent token into the same ciphertext slots via CKKS's unused
+    imaginary half. This lets one ciphertext hold `2*t_p` tokens instead of
+    `t_p`, halving cache ciphertext count for the same sequence length.
+    """
     if len(X_enc_chunks_ct) != len(W_enc_chunks):
         raise ValueError(
             f"X chunks ({len(X_enc_chunks_ct)}) and W chunks ({len(W_enc_chunks)}) differ."
@@ -79,9 +87,11 @@ def vmm_kv(
     if not X_enc_chunks_ct:
         raise ValueError("X_enc_chunks_ct cannot be empty.")
 
+    is_imag = pos >= dims.t_p
+    phys_pos = pos - dims.t_p if is_imag else pos
 
-    mask = torch.zeros(dims.n_he, dtype= torch.float64)
-    mask[pos::dims.t_p] = 1.0
+    mask = torch.zeros(dims.n_he, dtype=torch.complex128 if is_imag else torch.float64)
+    mask[phys_pos::dims.t_p] = 1j if is_imag else 1.0
     acc_level = level - 1
     mask_pt = orion.encode(mask, acc_level)
 
@@ -93,7 +103,7 @@ def vmm_kv(
         step, i = 1, 0
         while step < dims.t_p:
             counter.rotations += 1
-            acc = acc + ct_roll(acc, +step if (pos >> i) & 1 else -step)
+            acc = acc + ct_roll(acc, +step if (phys_pos >> i) & 1 else -step)
             step *= 2
             i += 1
 

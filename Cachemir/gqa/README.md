@@ -102,3 +102,78 @@ qkt_err=1.72e-04, softmaxv_err=1.44e-02
 `softmaxv_err` is the error in the final attention output after applying the attention weights to `V`.
 
 For CKKS/FHE runs, small numerical differences are expected because CKKS is approximate.
+
+## Complex Lane Packing: Validation Tests and Benchmarks
+
+The ciphertext implementation supports two K/V cache layouts, selected via
+the `pack_complex` flag threaded through `run_attention_gqa_he` (and the
+`HEKCache`/`HEVCache`/`softmax_v_gqa_he` helpers it calls):
+
+- `pack_complex=True` (default): packs 2 tokens per ciphertext using the
+  real and imaginary parts of each CKKS slot, roughly halving K/V cache
+  ciphertext count and ciphertext--ciphertext (ct-ct) multiplications as
+  sequence length grows.
+- `pack_complex=False`: the original real-only layout (1 token per
+  ciphertext slot), kept for direct comparison.
+
+See `Cachemir/gqa/ciphertext/docs/complex_packing.pdf` for the full
+mathematical write-up and benchmark results.
+
+### 7. Run the Complex-Packing Validation Tests
+
+Make sure the Orion environment is activated, then from `Cachemir/`:
+
+```bash
+python -m pytest gqa/ciphertext/test_complex_packing.py -v
+```
+
+This runs the same encrypted decoding step with `pack_complex=True` and
+`pack_complex=False` (identical seeds/config) and asserts that:
+
+- both modes agree with the plaintext reference within CKKS tolerance,
+- the two modes' decrypted attention scores and outputs match each other
+  (packing must not change the computed values),
+- the complex-packed run uses strictly fewer K/V cache ciphertexts and
+  ct-ct multiplications, and only the complex-packed run performs any
+  homomorphic conjugations.
+
+You can also run it as a plain script instead of via pytest:
+
+```bash
+python -m gqa.ciphertext.test_complex_packing
+```
+
+### 8. Run the Complex vs. Real-Only Performance Benchmark
+
+From `Cachemir/`:
+
+```bash
+python -m gqa.ciphertext.benchmark_complex_packing
+```
+
+This spawns one fresh subprocess per configuration per packing mode (so
+that peak-RAM measurements aren't contaminated across modes) and prints a
+side-by-side comparison table for each configuration, including:
+
+- latency (prefill / decode step / total, seconds),
+- peak resident set size (RSS, MB),
+- ciphertext counts affected by packing (`kcache`, `vcache`, `att_cts`,
+  `O` ciphertexts),
+- op counts (ct-ct multiplications, ct-pt multiplications, rotations,
+  conjugations), both in total and broken down per pipeline phase
+  (`q_projection`, `k_projection`, `v_projection`, `qkt`, `scores_v`).
+
+To benchmark a single configuration/mode directly (e.g. for scripting or
+profiling), invoke the worker mode directly:
+
+```bash
+python -m gqa.ciphertext.benchmark_complex_packing --worker --pack-complex \
+    --d 128 --H 8 --n_kv 4 --n_prefill 20 --level 7
+
+python -m gqa.ciphertext.benchmark_complex_packing --worker --no-pack-complex \
+    --d 128 --H 8 --n_kv 4 --n_prefill 20 --level 7
+```
+
+Each invocation prints one `BENCHMARK_RESULT_JSON {...}` line with the
+same metrics in machine-readable form.
+

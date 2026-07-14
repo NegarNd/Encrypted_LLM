@@ -16,11 +16,18 @@ class PackedHECache:
 
     name = "PackedHECache"
 
-    def __init__(self, n_he: int, d: int):
+    def __init__(self, n_he: int, d: int, pack_complex: bool = True):
         check_dims(n_he, d)
         self.n_he = n_he
         self.d = d
-        self.t = n_he // d
+        self.pack_complex = pack_complex
+        # When pack_complex=True, capacity is doubled relative to the
+        # real-only layout: each ciphertext packs `n_he // d` tokens into
+        # its real part and a second `n_he // d` tokens into its
+        # (previously unused) imaginary part, via complex lane packing in
+        # `vmm_kv`. When pack_complex=False, this reproduces the original
+        # real-only behavior (1 token-slot per lane) for comparison.
+        self.t = (2 if pack_complex else 1) * (n_he // d)
         self.ciphertexts: List[Any] = []
         self.length = 0
 
@@ -58,9 +65,13 @@ class HEKCache(PackedHECache):
 class HEVCache(PackedHECache):
     name = "HEVCache"
 
-    def __init__(self, n_he: int, d: int, H: int = 1):
-        super().__init__(n_he, d)
+    def __init__(self, n_he: int, d: int, H: int = 1, pack_complex: bool = True):
+        super().__init__(n_he, d, pack_complex=pack_complex)
         self.H = normalize_heads(H)
+        # NOTE: self.t (and thus self.t_p/self.B here) reflects the
+        # complex-packed *cache* capacity (2x the real-only lane block
+        # size). It is distinct from `dims.t_p`, which still describes the
+        # real-valued lane structure used by qkt_gqa_he/softmax_v_gqa_he.
         self.t_p = self.t
         self.d_h = d // self.H
         self.B = self.H * self.t_p

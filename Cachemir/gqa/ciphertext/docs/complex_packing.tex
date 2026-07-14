@@ -265,6 +265,7 @@ vector, conjugating homomorphically, decrypting, and comparing against
 \end{algorithm}
 
 \section{Cost Model}
+\label{sec:cost-model}
 
 Let $\mathrm{ratio} = H / n_{kv}$ and $C(N)$ be the number of K/V cache
 ciphertexts for $N$ cached tokens. Per decoding step, the read-side cost of
@@ -286,6 +287,7 @@ since each decoding step still injects exactly one new token regardless of
 packing.
 
 \section{Measured Results}
+\label{sec:measured-results}
 
 Configuration: $n_{he} = 512$, $d = 128$, $H = 8$, $n_{kv} = 4$
 ($d_h = 16$, $\mathrm{ratio} = 2$, $d_{kv} = 64$, $t_p = 8$).
@@ -371,7 +373,148 @@ slow growth with $N$ reflects accumulating CKKS noise across more ct-ct
 terms, independent of whether packing is used.}
 \end{table}
 
-\section{Summary}
+\section{Benchmark: Complex vs.\ Real-Only, Subprocess-Isolated}
+
+The cost-model tables in Section~\ref{sec:measured-results} were derived
+from operation counters within a single long-lived process. To also
+obtain clean, per-mode latency and peak-memory numbers, a dedicated
+benchmark harness (\texttt{Cachemir/gqa/ciphertext/\allowbreak
+benchmark\_complex\_packing.py}) runs each configuration \emph{twice},
+once with \texttt{pack\_complex=True} and once with
+\texttt{pack\_complex=False}, in two separate, freshly-spawned
+subprocesses per configuration. This isolation is necessary because
+peak resident set size (RSS) is a monotonically non-decreasing,
+process-wide high-water mark (via \texttt{resource.getrusage(\allowbreak
+RUSAGE\_SELF).ru\_maxrss}): measuring it for two modes inside the same
+process would contaminate the second measurement with the first mode's
+memory usage.
+
+\subsection{Hardware}
+Benchmarks were run on a single (non-virtualized) machine with the
+following relevant specifications:
+\begin{itemize}
+  \item CPU: 2$\times$ Intel(R) Xeon(R) Platinum 8260 @ 2.40\,GHz
+        (24 physical cores per socket, 48 physical cores / 96 logical
+        threads total via hyperthreading), NUMA with 2 nodes.
+  \item Cache: 1.5\,MiB L1d + 1.5\,MiB L1i, 48\,MiB L2, 71.5\,MiB L3
+        (shared, 2 instances).
+  \item Memory: 250\,GiB RAM.
+  \item OS/kernel: Linux 6.8 (Ubuntu), x86\_64.
+\end{itemize}
+Despite the machine having 96 logical cores available, the pipeline as
+benchmarked is \emph{single-threaded at the application level}: the
+Orion/Lattigo Go backend invoked here performs each ciphertext operation
+(rotation, ct-pt/ct-ct multiplication, conjugation) as one sequential
+call from the Python driver, and no goroutine/thread-pool parallelism
+across independent ciphertext operations is used in this code path (the
+Orion backend wrapper contains no explicit concurrency primitives such
+as \texttt{go func(...)} or worker pools for these operations). The
+reported wall-clock numbers therefore reflect single-core throughput of
+the CKKS backend, not a parallel/multi-core execution; the large core
+count and RAM headroom of the host mean the measurements are not
+resource-constrained, but they also do not benefit from multi-core
+speedup, and results should scale similarly on any single fast core of
+comparable clock speed.
+
+\subsection{Results}
+Each configuration below ran an $n_{\text{prefill}}$-token prefill loop
+followed by one encrypted decoding step, using
+$n_{he} = 512$, $d = 128$, $H = 8$, $n_{kv} = 4$
+($t_p = 8$, $\mathrm{ratio} = 2$) for the two larger cases, and
+$d = 8$, $H = 4$, $n_{kv} = 2$ ($t_p = 128$) for the smallest case.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lrrr}
+\toprule
+Metric ($d{=}8$, $n_{\text{prefill}}{=}5$) & Complex & Real-only & Ratio \\
+\midrule
+Latency: prefill (s)     & 0.803   & 0.813   & 0.99$\times$ \\
+Latency: decode step (s) & 0.420   & 0.404   & 1.04$\times$ \\
+Latency: total (s)       & 1.268   & 1.262   & 1.00$\times$ \\
+Peak RSS (MB)            & 857.0   & 851.0   & 1.01$\times$ \\
+kcache / vcache ciphertexts & 1 / 1 & 1 / 1 & 1.00$\times$ \\
+att\_cts / O ciphertexts    & 2 / 2 & 2 / 2 & 1.00$\times$ \\
+ct-ct mult (total)       & 4       & 4       & 1.00$\times$ \\
+Conjugations (total)     & 2       & 0       & n/a \\
+\bottomrule
+\end{tabular}
+\caption{Smallest case: cache already fits in a single ciphertext under
+both layouts ($t_p{=}128 \gg N{=}6$ tokens), so packing has no effect --
+included as a control.}
+\end{table}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lrrr}
+\toprule
+Metric ($d{=}128$, $n_{\text{prefill}}{=}9$) & Complex & Real-only & Ratio \\
+\midrule
+Latency: prefill (s)     & 9.334   & 9.293   & 1.00$\times$ \\
+Latency: decode step (s) & 1.147   & 1.181   & 0.97$\times$ \\
+Latency: total (s)       & 11.030  & 11.026  & 1.00$\times$ \\
+Peak RSS (MB)            & 1598.0  & 1600.2  & 1.00$\times$ \\
+kcache / vcache ciphertexts & 1 / 1 & 2 / 2 & 0.50$\times$ \\
+att\_cts ciphertexts        & 2     & 4     & 0.50$\times$ \\
+O ciphertexts               & 2     & 2     & 1.00$\times$ \\
+ct-ct mult (total)       & 4       & 8       & 0.50$\times$ \\
+ct-ct mult ($QK^\top$ phase)     & 2 & 4 & 0.50$\times$ \\
+ct-ct mult (scores$\times V$ phase) & 2 & 4 & 0.50$\times$ \\
+Conjugations (total)     & 2       & 0       & n/a \\
+\bottomrule
+\end{tabular}
+\caption{$N=10$ tokens is just past the real-only layout's single-ciphertext
+capacity ($t_p{=}8$), so the cache splits into 2 ciphertexts real-only vs.\
+1 under packing -- the ct-ct multiplication count halves accordingly in
+both the $QK^\top$ and scores$\times V$ phases.}
+\end{table}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lrrr}
+\toprule
+Metric ($d{=}128$, $n_{\text{prefill}}{=}20$) & Complex & Real-only & Ratio \\
+\midrule
+Latency: prefill (s)     & 19.742  & 19.843  & 0.99$\times$ \\
+Latency: decode step (s) & 1.205   & 1.256   & 0.96$\times$ \\
+Latency: total (s)       & 21.498  & 21.649  & 0.99$\times$ \\
+Peak RSS (MB)            & 2312.0  & 2311.3  & 1.00$\times$ \\
+kcache / vcache ciphertexts & 2 / 2 & 3 / 3 & 0.67$\times$ \\
+att\_cts ciphertexts        & 4     & 6     & 0.67$\times$ \\
+O ciphertexts               & 2     & 2     & 1.00$\times$ \\
+ct-ct mult (total)       & 8       & 12      & 0.67$\times$ \\
+ct-ct mult ($QK^\top$ phase)     & 4 & 6 & 0.67$\times$ \\
+ct-ct mult (scores$\times V$ phase) & 4 & 6 & 0.67$\times$ \\
+Conjugations (total)     & 4       & 0       & n/a \\
+\bottomrule
+\end{tabular}
+\caption{$N=21$ tokens: real-only needs $\lceil 21/8\rceil = 3$ cache
+ciphertexts vs.\ $\lceil 21/16\rceil = 2$ under packing, matching the
+0.67$\times$ ct-ct multiplication and ciphertext-count ratios observed
+elsewhere in this report for the same $N$.}
+\end{table}
+
+\subsection{Discussion}
+The ct-ct multiplication and ciphertext-count reductions match the
+closed-form cost model exactly (Section~\ref{sec:measured-results}).
+However, at these configurations \emph{total wall-clock latency and peak
+RAM are essentially unchanged} between the two modes ($\le$4\% difference,
+within run-to-run noise): the per-token \emph{write} path
+(\texttt{vmm\_kv}'s ct-pt multiply and $\log_2 t_p$-step rotation fold for
+each new token during prefill) dominates total time end-to-end, and that
+path is, by design, unaffected by this optimization (Section~\ref{sec:cost-model}).
+The benefit is concentrated in the smaller \emph{read}-side
+$QK^\top$/scores$\times V$ phases, whose ct-ct multiplication counts drop
+exactly as predicted; as sequence length grows well beyond the prefill
+regime tested here (i.e.\ many decoding steps re-reading an already-long
+cache, rather than one write per read as in this benchmark), the read-side
+savings are expected to dominate overall latency and peak memory far more
+visibly than in these prefill-dominated measurements.
+
+
 
 \begin{itemize}
   \item Two tokens are packed per CKKS ciphertext slot using the real and
