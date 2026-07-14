@@ -37,6 +37,9 @@ def decode_output(O: np.ndarray, dims: GQADims) -> np.ndarray:
 
     return O_dense
 
+def _softmax(x: np.ndarray) -> np.ndarray:
+    e = np.exp(x - np.max(x))
+    return e / np.sum(e)
 
 def reference_attention(
     toks: List[np.ndarray],
@@ -74,9 +77,11 @@ def reference_attention(
     ref_O = np.zeros((dims.H, dims.d_h), dtype=np.float64)
     for h in range(dims.H):
         kv = h // dims.ratio
+        scores = np.array([score(h, tok) for tok in range(n_tokens)])
+        weights = _softmax(scores)
         for dim in range(dims.d_h):
             g = dim * dims.n_kv + kv
-            ref_O[h, dim] = sum(V_matrix[tok, g] * score(h, tok) for tok in range(n_tokens))
+            ref_O[h, dim] = sum(V_matrix[tok, g] * weights[tok] for tok in range(n_tokens))
 
     return ref_map, ref_O
 
