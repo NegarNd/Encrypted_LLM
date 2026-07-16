@@ -49,8 +49,14 @@ def reference_attention(
     Wv_raw: torch.Tensor,
     dims: GQADims,
     head_perm: Callable[[int, int], list[int]],
+    apply_softmax: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute dense reference QK^T and scores*V results."""
+    """Compute dense reference QK^T and scores*V results.
+
+    apply_softmax: set False to match pipelines (e.g. the current ciphertext
+    path) that multiply V by the raw structural attention scores directly,
+    without a softmax normalization step.
+    """
     all_toks = toks + [x_new]
     n_tokens = len(all_toks)
     perm_kv = head_perm(dims.d_kv, dims.n_kv)
@@ -78,7 +84,7 @@ def reference_attention(
     for h in range(dims.H):
         kv = h // dims.ratio
         scores = torch.stack([score(h, tok) for tok in range(n_tokens)])
-        weights = _softmax(scores)
+        weights = _softmax(scores) if apply_softmax else scores
         for dim in range(dims.d_h):
             g = dim * dims.n_kv + kv
             ref_O[h, dim] = sum(V_matrix[tok, g] * weights[tok] for tok in range(n_tokens))
@@ -96,10 +102,17 @@ def compare_attention_outputs(
     O: torch.Tensor,
     dims: GQADims,
     head_perm: Callable[[int, int], list[int]],
+    apply_softmax: bool = True,
 ) -> tuple[float, float]:
-    """Return max absolute errors for QK^T and scores*V."""
+    """Return max absolute errors for QK^T and scores*V.
+
+    apply_softmax: forwarded to reference_attention -- set False when O was
+    computed without a softmax normalization step (e.g. the ciphertext path).
+    """
     n_tokens = len(toks) + 1
     decoded_map = decode_attention_map(att_cts, n_tokens, dims)
     O_dense = decode_output(O, dims)
-    ref_map, ref_O = reference_attention(toks, x_new, Wq_raw, Wk_raw, Wv_raw, dims, head_perm)
+    ref_map, ref_O = reference_attention(
+        toks, x_new, Wq_raw, Wk_raw, Wv_raw, dims, head_perm, apply_softmax=apply_softmax
+    )
     return float(torch.max(torch.abs(decoded_map - ref_map))), float(torch.max(torch.abs(O_dense - ref_O)))
