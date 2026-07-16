@@ -1,9 +1,8 @@
 """Ciphertext-domain GQA attention using Orion."""
 
 from .he_cache_orion import HEKCache, HEVCache
+from .he_encoding_orion import expand_sparse_input_kv_he
 from .he_attention_orion import (
-    # encode_encrypt_sparse_input,\
-    expand_sparse_input_kv_he,
     attention_gqa_he,
     run_attention_gqa_he,
 )
@@ -11,8 +10,7 @@ from .he_attention_orion import (
 __all__ = [
     "HEKCache",
     "HEVCache",
-    # "encode_encrypt_sparse_input",
-    expand_sparse_input_kv_he,
+    "expand_sparse_input_kv_he",
     "attention_gqa_he",
     "run_attention_gqa_he",
 ]

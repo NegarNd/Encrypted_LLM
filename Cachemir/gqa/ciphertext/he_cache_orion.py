@@ -9,7 +9,7 @@ from ..plaintext.dims import check_dims, normalize_heads
 class PackedHECache:
     """Cache that packs t tokens into one ciphertext.
 
-    The plaintext cache used np.zeros(N) for a new packed block.  In HE, a new
+    The plaintext cache used torch.zeros(N) for a new packed block.  In HE, a new
     block starts as the first positioned ciphertext itself; later tokens are
     homomorphically added into the same packed block.
     """

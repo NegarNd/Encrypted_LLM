@@ -16,6 +16,7 @@ CASES = [
     # Checked for small d values - PASS
     #d, H, n_kv, n_prefill
     (8, 4, 2, 5),
+    # (16, 8, 4, 2, 5)
     # (8, 4, 2, 6),
     # (8, 4, 2, 3),
     # (8, 4, 2, 4),
@@ -46,10 +47,9 @@ def get_config_path(yml_name: str) -> str:
 
 
 def main() -> None:
+   
     config_path = get_config_path("gqa.yml")
-
     print(f"Encoding level: {LEVEL}")
-    print()
     scheme = orion.init_scheme(config_path)
     n_he = 1 << (scheme.params.get_logn() - 1)
 
@@ -57,7 +57,6 @@ def main() -> None:
     for d, H, n_kv, n_prefill in CASES:
         counter.reset()
         err_qkt, err_v = run_attention_gqa_he(
-            config_path=config_path,
             n_he = n_he,
             d=d,
             H=H,

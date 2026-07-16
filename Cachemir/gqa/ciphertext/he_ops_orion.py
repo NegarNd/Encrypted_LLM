@@ -9,9 +9,10 @@ import orion
  
 from ..plaintext.dims import GQADims, check_dims
 from ..plaintext.counter import counter
- 
-# Set this to False if Orion's rotate/rot API has torch.roll's sign convention.
-ROTATION_IS_LEFT = True
+
+# Orion's ct.roll(k) rotates opposite to torch.roll(x, k), so every rotation
+# below calls .roll(-shift) to stay consistent with the plaintext simulator's
+# torch.roll(x, -shift) calls.
 
 
 def encode_pt(vec: torch.Tensor, level: int) -> Any:
@@ -19,50 +20,11 @@ def encode_pt(vec: torch.Tensor, level: int) -> Any:
     vec = torch.as_tensor(vec, dtype=torch.float64)
     return orion.encode(vec, level)
 
-# def _rotate_raw(ct: Any, amount: int) -> Any:
-#     """Call the rotation method exposed by the installed Orion ciphertext."""
-#     # Bound methods on the ciphertext object.
-#     for name in ("rotate", "rot", "roll"):
-#         meth = getattr(ct, name, None)
-#         if callable(meth):
-#             return meth(amount)
-
-#     # Module-level helpers, depending on Orion version.
-#     for name in ("rotate", "rot", "roll"):
-#         fn = getattr(orion, name, None)
-#         if callable(fn):
-#             return fn(ct, amount)
-
-#     raise AttributeError(
-#         "Could not find an Orion ciphertext rotation API. Tried ct.rotate/ct.rot/ct.roll "
-#         "and orion.rotate/orion.rot/orion.roll. Adjust _rotate_raw() for your Orion build."
-#     )
-
-
-def ct_roll(ct: Any, shift: int) -> Any:
-    """Ciphertext equivalent of torch.roll(ct, shift)."""
-    if shift == 0:
-        return ct
-    amount = -shift if ROTATION_IS_LEFT else shift
-    return ct.roll(amount)
 
 def ct_zero(n_he: int, level: int) -> Any:
     """Create an encrypted zero vector at `level`."""
     zero_vec = torch.zeros(n_he, dtype=torch.float64)
     return orion.encrypt(orion.encode(zero_vec, level))
-
-
-def ct_add_many(values: Iterable[Any]) -> Any:
-    """Sum a list of ciphertexts. Pure ct-ct addition -- level-neutral, no
-    plaintexts involved, so no `level` argument is needed."""
-    vals = list(values)
-    if not vals:
-        raise ValueError("ct_add_many() needs at least one ciphertext.")
-    acc = vals[0] * 0.0
-    for v in vals[1:]:
-        acc = acc + v
-    return acc
-
 
 def vmm_kv(
     X_enc_chunks_ct: List[Any],
@@ -93,7 +55,7 @@ def vmm_kv(
         step, i = 1, 0
         while step < dims.t_p:
             counter.rotations += 1
-            acc = acc + ct_roll(acc, +step if (pos >> i) & 1 else -step)
+            acc = acc + acc.roll(-step if (pos >> i) & 1 else step)
             step *= 2
             i += 1
 
@@ -111,7 +73,7 @@ def block_replicate(v_ct: Any, t_p: int) -> Any:
     step = 1
     while step < t_p:
         counter.rotations += 1
-        out = out + ct_roll(out, step)
+        out = out + out.roll(-step)
         step *= 2
     return out
 
