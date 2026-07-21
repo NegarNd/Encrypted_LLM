@@ -15,7 +15,14 @@ import orion
 import torch
 
 from ..plaintext.dims import GQAConfig, GQADims, make_gqa_dims
-from ..plaintext.encoding import head_perm, init_input
+from ..plaintext.encoding import (
+    head_perm,
+    init_input,
+    make_sparse_input_kv,
+    expand_sparse_input_kv_plain,
+)
+from ..plaintext.cache import KCache, VCache
+from ..plaintext.ops import vmm_kv as vmm_kv_plain
 from ..plaintext.reference import compare_attention_outputs
 from ..plaintext.counter import counter
 from .he_cache_orion import HEKCache, HEVCache
@@ -226,26 +233,44 @@ def run_attention_gqa_he(
     """End-to-end encrypted test driver."""
     dims = make_gqa_dims(GQAConfig(n_he=n_he, d=d, H=H, n_kv=n_kv, n_prefill=n_prefill))
 
-    Wq_raw, Wq_list = make_he_weights_q_gqa(dims, seed=seeds[0], n_he=n_he, level=level)
-    Wk_raw, Wk_list = make_he_weights_kv(dims, seed=seeds[1], n_he=n_he, level=level)
-    Wv_raw, Wv_list = make_he_weights_kv(dims, seed=seeds[2], n_he=n_he, level=level)
+    Wq_raw, Wq_list, _Wq_list_raw = make_he_weights_q_gqa(dims, seed=seeds[0], n_he=n_he, level=level)
+    Wk_raw, Wk_list, Wk_list_raw = make_he_weights_kv(dims, seed=seeds[1], n_he=n_he, level=level)
+    Wv_raw, Wv_list, Wv_list_raw = make_he_weights_kv(dims, seed=seeds[2], n_he=n_he, level=level)
+    print("weights are generated")
 
     kcache = HEKCache(n_he, dims.d_kv)
     vcache = HEVCache(n_he, dims.d_kv, H=dims.n_kv)
 
     toks = [init_input(dims.d, seed=10 + i) for i in range(n_prefill)]
 
+    # Prefill is computed in plaintext (cheap) instead of paying HE cost per
+    # prefill token. Only the final packed cache blocks are encrypted, at the
+    # same level `vmm_kv` would have produced (level - 2), so they line up
+    # with the ciphertexts produced by the real HE path used for new tokens.
     before = _op_counts()
+    t_prefill_start = time.perf_counter()
+
+    kcache_plain = KCache(dims.n_he, dims.d_kv)
+    vcache_plain = VCache(dims.n_he, dims.d_kv, H=dims.n_kv)
+
     for x in toks:
-        x_sparse_ct = encrypt_sparse_input_kv(x, dims, level=level)
-        xc_ct = expand_sparse_input_kv_he(x_sparse_ct, dims)
+        x_sparse = make_sparse_input_kv(x, dims)
+        xc = expand_sparse_input_kv_plain(x_sparse, dims)
+        kcache_plain.append(vmm_kv_plain(xc, Wk_list_raw, dims, pos=len(kcache_plain) % dims.t_p))
+        vcache_plain.append(vmm_kv_plain(xc, Wv_list_raw, dims, pos=len(vcache_plain) % dims.t_p))
 
-        k_new, _ = vmm_kv(xc_ct, Wk_list, dims, level, pos=len(kcache) % dims.t_p)
-        kcache.append(k_new)
+    kv_out_level = level - 2
+    for block in kcache_plain.ciphertexts:
+        kcache.ciphertexts.append(orion.encrypt(orion.encode(block, kv_out_level)))
+    kcache.length = kcache_plain.length
 
-        v_new, _ = vmm_kv(xc_ct, Wv_list, dims, level, pos=len(vcache) % dims.t_p)
-        vcache.append(v_new)
-    _log_ops(f"run_attention_gqa_he: fill caches ({n_prefill} tok)", before)
+    for block in vcache_plain.ciphertexts:
+        vcache.ciphertexts.append(orion.encrypt(orion.encode(block, kv_out_level)))
+    vcache.length = vcache_plain.length
+
+    prefill_elapsed = time.perf_counter() - t_prefill_start
+    _log_ops(f"run_attention_gqa_he: fill caches ({n_prefill} tok, plaintext)", before)
+    print(f"[run_attention_gqa_he] prefill (plaintext compute + final encrypt) time={prefill_elapsed:8.4f}s")
 
     before = _op_counts()
     x_new = init_input(dims.d, seed=seeds[3])
@@ -253,9 +278,12 @@ def run_attention_gqa_he(
     xc_new_ct = expand_sparse_input_kv_he(x_sparse_ct, dims)
     _log_ops("run_attention_gqa_he: generate input", before)
 
+    t_gen_start = time.perf_counter()
     Q_cts, K_new, V_new, att_cts, O_cts, out_level = attention_gqa_he(
         xc_new_ct, kcache, vcache, Wq_list, Wk_list, Wv_list, dims, level,
     )
+    gen_elapsed = time.perf_counter() - t_gen_start
+    print(f"[run_attention_gqa_he] generate new token time={gen_elapsed:8.4f}s")
 
     if not verify:
         if verbose:

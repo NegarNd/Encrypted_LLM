@@ -109,31 +109,39 @@ def expand_sparse_input_kv_he(sparse_cts: List[Any], dims: GQADims) -> List[Any]
 
 def make_he_weights_q_gqa(dims: GQADims, *, seed: int = 1, n_he: int, level: int):
     """Generate raw Wq and Orion-encoded compact Q weight plaintexts.
- 
+
     Returns:
         Wq_raw:
             Raw weight matrix, used for reference checking.
         Wq_enc_list:
             Nested list of Orion plaintexts, ready for ct-pt multiplication
             against ciphertexts at `level`.
+        Wq_enc_list_raw:
+            Nested list of plain torch chunks (pre-Orion-encoding), usable
+            directly with `plaintext.ops.vmm_kv` for plaintext-domain
+            computation (e.g. a fast plaintext prefill pass).
     """
     Wq_raw, Wq_enc_list_raw = make_weights_q_gqa(dims, seed=seed)
     Wq_enc_list = encode_plain_nested_list(Wq_enc_list_raw, n_he=n_he, level=level)
-    return Wq_raw, Wq_enc_list
- 
+    return Wq_raw, Wq_enc_list, Wq_enc_list_raw
+
 
 
  
 def make_he_weights_kv(dims: GQADims, *, seed: int = 1, n_he: int, level: int):
     """Generate raw Wk/Wv and Orion-encoded compact K/V weight plaintexts.
- 
+
     Returns:
         W_raw:
             Raw weight matrix, used for reference checking.
         W_enc:
             Flat list of Orion plaintexts, ready for ct-pt multiplication
             against ciphertexts at `level`.
+        W_enc_raw:
+            Flat list of plain torch chunks (pre-Orion-encoding), usable
+            directly with `plaintext.ops.vmm_kv` for plaintext-domain
+            computation (e.g. a fast plaintext prefill pass).
     """
     W_raw, W_enc_raw = make_weights_kv(dims, seed=seed)
     W_enc = encode_plain_list(W_enc_raw, n_he=n_he, level=level)
-    return W_raw, W_enc
+    return W_raw, W_enc, W_enc_raw
