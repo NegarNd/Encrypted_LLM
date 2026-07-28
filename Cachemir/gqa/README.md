@@ -71,6 +71,51 @@ python -m gqa.plaintext.verify_gqa
 
 This runs the plaintext GQA implementation and checks the packed attention computation against the reference computation.
 
+### 5. Compare Complex-Lane-Packing Strategies (Plaintext Cost Simulator)
+
+Two extra plaintext scripts explore where CKKS complex-lane packing (packing
+2 real values per ciphertext slot via the real/imaginary parts) is most
+effective in the decode pipeline. Both reuse the same op-counting convention
+as `verify_gqa.py` (`rotations` / `ct_pt_mult` / `ct_ct_mult`) plus an
+illustrative per-op microsecond cost (loosely based on published GPU
+RNS-CKKS microbenchmarks) to estimate relative latency -- no FHE library is
+involved, this is pure `torch` arithmetic used purely for cost comparison.
+
+Run the VMM-packing vs. attention-score-packing comparison:
+
+```bash
+python -m gqa.plaintext.vmm_complex_pack_compare
+```
+
+This builds one decode step (prefill + 1 new token) for every case in
+`verify_gqa.py`'s `CASES` and reports op counts / estimated latency for
+three strategies:
+
+- `baseline`: no complex packing anywhere.
+- `attn_complex`: complex-pack 2 tokens/ciphertext in the K-cache and
+  V-cache (mirrors `gqa/ciphertext/he_attention_orion.py`'s `pack_complex`
+  trick for `QK^T` / `scores*V`).
+- `vmm_complex`: complex-pack the K/V projection weights (and paired Q
+  projections) so a single ct-pt multiply produces two independent real
+  QKV outputs at once, since the token activation `X` is real (no
+  cross-term risk when only one multiplicand is complex-packed).
+
+It asserts all three strategies decode to the same dense output (max error
+< 1e-9) before printing the summary table.
+
+Then estimate the added cost of integrating `softmax_jh.py`'s AppExp/AppInv
+approximate softmax and see how it changes the pipeline-level impact of the
+two packing strategies above:
+
+```bash
+python -m gqa.plaintext.softmax_cost_estimate
+```
+
+This loads `softmax_jh.py` (currently a standalone draft whose relative
+imports assume it lives inside `gqa.plaintext`) via `importlib`,
+instruments its `AppExp`/`AppInv` multiplications, and adds that cost on
+top of each strategy's pipeline total from `vmm_complex_pack_compare.py`.
+
 ### 6. Run the Orion Ciphertext GQA Verification
 
 Make sure the Orion environment is activated:
