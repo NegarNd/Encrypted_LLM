@@ -14,6 +14,7 @@ class Counter:
     rotation_amounts: Set[int] = field(default_factory=set)
     rotation_trace: List[int] = field(default_factory=list)
     stages: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    total_runtime_seconds: float = 0.0
 
     def reset(self) -> None:
         self.rotations = 0
@@ -22,6 +23,7 @@ class Counter:
         self.rotation_amounts.clear()
         self.rotation_trace.clear()
         self.stages.clear()
+        self.total_runtime_seconds = 0.0
 
     def record_rotation(self, amount: int, n_he: int) -> None:
         """Record one rotation and its normalized nonzero key amount."""
@@ -45,7 +47,14 @@ class Counter:
             len(self.rotation_trace),
         )
 
-    def record_stage(self, name: str, before: tuple[int, int, int, int]) -> None:
+    def record_stage(
+        self,
+        name: str,
+        before: tuple[int, int, int, int],
+        runtime_seconds: float = 0.0,
+        level_before: int | None = None,
+        level_after: int | None = None,
+    ) -> None:
         r0, cp0, cc0, trace_start = before
         amounts = sorted(set(self.rotation_trace[trace_start:]))
         self.stages[name] = {
@@ -54,16 +63,20 @@ class Counter:
             "rotation_amounts": amounts,
             "ct_pt_mult": self.ct_pt_mult - cp0,
             "ct_ct_mult": self.ct_ct_mult - cc0,
+            "runtime_seconds": runtime_seconds,
+            "level_before": level_before,
+            "level_after": level_after,
         }
 
     def summary(self) -> str:
-        amounts = sorted(self.rotation_amounts)
+        # amounts = sorted(self.rotation_amounts)
         return (
             f"rotations={self.rotations}, "
-            f"unique_rotation_amounts={self.unique_rotations}, "
-            f"rotation_amounts={amounts}, "
+            # f"unique_rotation_amounts={self.unique_rotations}, "
+            # f"rotation_amounts={amounts}, "
             f"ct-pt={self.ct_pt_mult}, "
-            f"ct-ct={self.ct_ct_mult}"
+            f"ct-ct={self.ct_ct_mult}, "
+            f"runtime={self.total_runtime_seconds:.6f}s"
         )
 
 

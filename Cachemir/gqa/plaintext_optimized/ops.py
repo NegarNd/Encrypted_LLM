@@ -1,33 +1,31 @@
-"""HE-like primitive operations implemented with NumPy."""
+"""HE-like primitive operations implemented with PyTorch."""
 
 from __future__ import annotations
 
-from typing import List, Sequence
+from typing import Sequence
 
-import numpy as np
+import torch
 
 from .counter import counter
 from .dims import GQADims
 
 
-def rotate_left(value: np.ndarray, amount: int) -> np.ndarray:
-    """Simulate one ciphertext left rotation and record its key amount."""
-    counter.record_rotation(amount, value.size)
-    return np.roll(value, -amount)
+def rotate_left(value: torch.Tensor, amount: int) -> torch.Tensor:
+    counter.record_rotation(amount, value.numel())
+    return torch.roll(value, shifts=-amount, dims=-1)
 
 
-def multiply_plain(value: np.ndarray, plaintext: np.ndarray) -> np.ndarray:
+def multiply_plain(value: torch.Tensor, plaintext: torch.Tensor) -> torch.Tensor:
     counter.ct_pt_mult += 1
     return value * plaintext
 
 
-def multiply_cipher(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+def multiply_cipher(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
     counter.ct_ct_mult += 1
     return left * right
 
 
-def reduce_lanes(value: np.ndarray, dims: GQADims, pos: int = 0) -> np.ndarray:
-    """Sum each t_p-slot partial-dot-product block into lane ``pos``."""
+def reduce_lanes(value: torch.Tensor, dims: GQADims, pos: int = 0) -> torch.Tensor:
     out = value
     step = 1
     bit = 0
@@ -37,87 +35,76 @@ def reduce_lanes(value: np.ndarray, dims: GQADims, pos: int = 0) -> np.ndarray:
         step *= 2
         bit += 1
 
-    mask = np.zeros(dims.n_he, dtype=np.float64)
+    mask = value.new_zeros(dims.n_he)
     mask[pos :: dims.t_p] = 1.0
     return multiply_plain(out, mask)
 
 
-def replicate_lanes(value: np.ndarray, dims: GQADims) -> np.ndarray:
-    """Replicate lane zero to all t_p token lanes."""
+def block_replicate(value: torch.Tensor, block_size: int) -> torch.Tensor:
+    """Replicate the first slot of every block across that block."""
     out = value
     step = 1
-    while step < dims.t_p:
+    while step < block_size:
         out = out + rotate_left(out, -step)
         step *= 2
     return out
 
 
-def prepare_shared_projection_inputs(
-    x_ct: np.ndarray,
-    dims: GQADims,
-) -> List[np.ndarray]:
-    """Create the input rotations shared by all Q/K/V projections."""
-    if dims.qkv_method == "direct":
-        inputs = [x_ct]
-        for r in range(1, dims.m_p):
-            inputs.append(rotate_left(x_ct, r * dims.t_p))
-        return inputs
+def replicate_lanes(value: torch.Tensor, dims: GQADims) -> torch.Tensor:
+    return block_replicate(value, dims.t_p)
 
-    inputs = [x_ct]
-    for baby in range(1, dims.bsgs_baby_steps):
-        inputs.append(rotate_left(x_ct, baby * dims.t_p))
-    return inputs
+
+def prepare_shared_projection_inputs(
+    x_ct: torch.Tensor,
+    dims: GQADims,
+) -> list[torch.Tensor]:
+    if dims.qkv_method == "direct":
+        amounts = [r * dims.t_p for r in range(1, dims.m_p)]
+    else:
+        amounts = [
+            baby * dims.t_p for baby in range(1, dims.bsgs_baby_steps)
+        ]
+    return [x_ct, *(rotate_left(x_ct, amount) for amount in amounts)]
 
 
 def evaluate_direct_projection(
-    x_rotations: Sequence[np.ndarray],
-    encoded_diagonals: Sequence[np.ndarray],
-) -> np.ndarray:
-    """Evaluate one projection from a previously shared set of X rotations."""
-    acc = np.zeros_like(x_rotations[0])
+    x_rotations: Sequence[torch.Tensor],
+    encoded_diagonals: Sequence[torch.Tensor],
+) -> torch.Tensor:
+    acc = torch.zeros_like(x_rotations[0])
     for x_rot, diagonal in zip(x_rotations, encoded_diagonals):
-        acc += multiply_plain(x_rot, diagonal)
+        acc = acc + multiply_plain(x_rot, diagonal)
     return acc
 
 
 def evaluate_bsgs_projection(
-    babies: Sequence[np.ndarray],
-    encoded_diagonals: Sequence[np.ndarray],
+    babies: Sequence[torch.Tensor],
+    encoded_diagonals: Sequence[torch.Tensor],
     dims: GQADims,
-) -> np.ndarray:
-    """Evaluate one BSGS projection from shared baby-step rotations."""
+) -> torch.Tensor:
     b = dims.bsgs_baby_steps
-    g = dims.bsgs_giant_steps
-    out = np.zeros_like(babies[0])
-
-    for giant in range(g):
+    out = torch.zeros_like(babies[0])
+    for giant in range(dims.bsgs_giant_steps):
         giant_amount = giant * b * dims.t_p
-        group = np.zeros_like(babies[0])
-
+        group = torch.zeros_like(babies[0])
         for baby in range(b):
             diagonal_index = giant * b + baby
             if diagonal_index >= dims.m_p:
                 break
-
             diagonal = encoded_diagonals[diagonal_index]
-            # RotL(baby * RotR(P, giant), giant)
-            # equals RotL(X, diagonal_index*t_p) * P.
-            adjusted = np.roll(diagonal, giant_amount)
-            group += multiply_plain(babies[baby], adjusted)
-
+            adjusted = torch.roll(diagonal, shifts=giant_amount, dims=-1)
+            group = group + multiply_plain(babies[baby], adjusted)
         if giant:
             group = rotate_left(group, giant_amount)
-        out += group
-
+        out = out + group
     return out
 
 
 def evaluate_projection(
-    shared_inputs: Sequence[np.ndarray],
-    encoded_diagonals: Sequence[np.ndarray],
+    shared_inputs: Sequence[torch.Tensor],
+    encoded_diagonals: Sequence[torch.Tensor],
     dims: GQADims,
-) -> np.ndarray:
-    """Evaluate one Q, K, or V projection using prepared shared inputs."""
+) -> torch.Tensor:
     if dims.qkv_method == "direct":
         return evaluate_direct_projection(shared_inputs, encoded_diagonals)
     return evaluate_bsgs_projection(shared_inputs, encoded_diagonals, dims)
