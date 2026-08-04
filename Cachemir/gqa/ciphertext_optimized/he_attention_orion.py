@@ -37,6 +37,7 @@ from .he_ops_orion import (
     replicate_lanes,
     rotate_left,
 )
+from .softmax import app_softmax_gqa_he
 
 SoftmaxEvaluator = Callable[
     [list[list[Any]], int, GQADims],
@@ -199,10 +200,7 @@ def attention_gqa_he(
     any polynomial/normalization implementation, but must not decrypt.
     """
     if not skip_softmax and softmax_evaluator is None:
-        raise ValueError(
-            "A ciphertext softmax_evaluator is required. "
-            "Pass skip_softmax=True to compute QK^T V without softmax."
-        )
+        softmax_evaluator = app_softmax_gqa_he
     if len(kcache) != len(vcache):
         raise ValueError("K and V caches must contain the same number of tokens.")
 
@@ -346,10 +344,7 @@ def prepare_attention_gqa_he(
     x_new = init_input(d, seeds[3])
     x_ct = encrypt_input(x_new, dims, level=level)
     if not skip_softmax and softmax_evaluator is None:
-        raise ValueError(
-            "Pass your Orion ciphertext softmax as softmax_evaluator, or set "
-            "skip_softmax=True to compute QK^T V."
-        )
+        softmax_evaluator = app_softmax_gqa_he
 
     return PreparedAttentionGQAHE(
         dims=dims,
